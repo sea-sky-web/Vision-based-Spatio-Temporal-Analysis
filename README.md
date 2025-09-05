@@ -25,10 +25,10 @@ BEVFormer 是一个强大的、基于 Transformer 的模型，能够将来自多
 
 ## 1. 环境搭建
 
-建议使用 `conda` 创建独立的虚拟环境。
+为了确保兼容性并避免潜在的依赖冲突，强烈建议使用 `conda` 创建一个独立的 **Python 3.8** 虚拟环境。
 
 ### 系统要求
-- Python 3.8+
+- **Python 3.8 (强制)**
 - PyTorch 1.9.0+
 - CUDA 11.1+
 
@@ -46,22 +46,31 @@ BEVFormer 是一个强大的、基于 Transformer 的模型，能够将来自多
     conda activate bevformer-wildtrack
     ```
 
-3.  **安装 PyTorch:**
-    *请根据您的 CUDA 版本选择合适的命令。*
+3.  **安装核心依赖 (PyTorch, MMCV, MMDetection):**
+    *为了避免因本地编译耗时过长或失败，我们提供了一系列使用预编译包的命令。请严格按照以下步骤执行。*
+
+    a. **安装 PyTorch:**
     ```bash
-    # 示例 (CUDA 11.1)
+    # 适用于 CUDA 11.1 的版本
     pip install torch==1.9.0+cu111 torchvision==0.10.0+cu111 torchaudio==0.7.2 -f https://download.pytorch.org/whl/torch_stable.html
     ```
 
-4.  **安装 MMCV 和 MMDetection:**
-    *注意：BEVFormer 依赖于特定版本的库。如果遇到编译或运行时错误，请严格遵循以下版本要求。*
+    b. **安装 MMCV:**
     ```bash
-    pip install openmim
-    mim install mmcv-full==1.3.17
-    mim install mmdet==2.14.0
+    pip install mmcv-full==1.3.17 -f https://download.openmmlab.com/mmcv/dist/cu111/torch1.9.0/index.html
     ```
 
-5.  **安装其他依赖项:**
+    c. **安装 MMDetection:**
+    ```bash
+    pip install mmdet==2.14.0
+    ```
+
+    d. **安装 MMDetection3D:**
+    ```bash
+    pip install mmdet3d==0.14.0
+    ```
+
+4.  **安装其他依赖项:**
     ```bash
     cd BEVFormer
     pip install -r requirements.txt
@@ -128,3 +137,17 @@ BEVFormer 是一个强大的、基于 Transformer 的模型，能够将来自多
 - 本项目当前仅用于**快速验证**，不包含模型训练部分。
 - 使用的预训练模型基于 nuScenes 数据集，在 Wildtrack 数据集上可能不是最优的，需要进一步微调才能达到更好的性能。
 - 相机参数的解析逻辑位于 `custom/wildtrack_dataset.py` 中，可能需要根据实际的数据格式进行调整。
+
+## 常见问题
+
+1.  **安装 `mmcv-full` 或 `mmdet3d` 失败/超时:**
+    - **原因**: 这通常是由于本地环境缺少编译工具链或网络问题导致无法直接从源码编译。
+    - **解决方案**: 请严格遵循 `1. 环境搭建` 中提供的命令，通过 `-f` 参数指定预编译包的下载地址，可以避免本地编译。
+
+2.  **`ModuleNotFoundError: No module named 'numpy.distutils'`:**
+    - **原因**: 这个问题出现在较新的 `numpy` 版本（>=1.22）中，因为 `distutils` 已被移除。项目依赖的 `numba==0.48.0` 需要此模块。
+    - **解决方案**: 确保您使用的是 **Python 3.8** 环境。在此环境下，`pip` 会自动安装与 `numba==0.48.0` 兼容的 `numpy` 版本。
+
+3.  **`AttributeError: module 'configparser' has no attribute 'SafeConfigParser'`:**
+    - **原因**: `SafeConfigParser` 在 Python 3.12 中已被移除。
+    - **解决方案**: 这是环境不兼容的典型表现。请务必使用 **Python 3.8**。
