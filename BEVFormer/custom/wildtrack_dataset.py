@@ -1,99 +1,119 @@
 import os
 import cv2
 import numpy as np
-import torch
+import json
+import xml.etree.ElementTree as ET
+from mmdet3d.datasets.custom_3d import Custom3DDataset
+from mmdet3d.datasets.builder import DATASETS
 
-# 假设BEVFormer的NuScenesDataset类已经存在
-# 实际使用时需要确保正确导入
-class CustomWildTrackDataset:
-    """自定义WildTrack数据集类，用于加载WildTrack数据集的图像和相机参数"""
-    
-    def __init__(self, data_root='data/Wildtrack/', **kwargs):
-        """初始化数据集
-        
-        Args:
-            data_root: WildTrack数据集的根目录
-        """
+@DATASETS.register_module()
+class WildTrackDataset(Custom3DDataset):
+    """WildTrack数据集加载器，与MMDetection3D框架兼容"""
+
+    CLASSES = ('Pedestrian',)
+
+    def __init__(self, data_root, ann_file, pipeline=None, test_mode=False, **kwargs):
         self.data_root = data_root
+        self.annotation_path = os.path.join(self.data_root, 'annotations_positions/')
         self.calib_path = os.path.join(self.data_root, 'calibrations/')
+        self.num_cams = 7
+        # Wildtrack有400帧
+        self.frame_indices = list(range(400))
         
-    def prepare_test_data(self, idx):
-        """准备测试数据
-        
-        Args:
-            idx: 帧索引
-            
-        Returns:
-            dict: 包含图像和相机参数的字典
-        """
-        info = {
-            'img_metas': {
-                'cam_intrinsic': self.load_intrinsics(),
-                'cam_extrinsic': self.load_extrinsics(),
-                'num_cams': 7
-            },
-            'img': self.load_images(idx)
-        }
-        return info
-    
-    def load_images(self, frame_id=0):
-        """加载WildTrack第frame_id帧的7张图像
-        
-        Args:
-            frame_id: 帧索引，默认为0
-            
-        Returns:
-            np.array: 形状为[7, H, W, 3]的图像数组
-        """
-        images = []
-        for i in range(1, 8):  # WildTrack有7个摄像头，编号从1到7
-            path = f"{self.data_root}/Image_subsets/C{i}/{frame_id:08d}.png"
-            img = cv2.imread(path)
-            if img is None:
-                raise FileNotFoundError(f"无法加载图像: {path}")
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            images.append(img)
-        return np.stack(images)
-    
-    def load_intrinsics(self):
-        """加载相机内参
-        
-        Returns:
-            list: 包含7个相机内参矩阵的列表
-        """
+        super().__init__(
+            data_root=data_root,
+            ann_file=ann_file,
+            pipeline=pipeline,
+            classes=self.CLASSES,
+            test_mode=test_mode,
+            **kwargs
+        )
+
+    def _parse_xml_matrix(self, xml_file, data_tag):
+        tree = ET.parse(xml_file)
+        root = tree.getroot()
+        data_element = root.find(f".//{data_tag}")
+        rows = int(data_element.find("rows").text)
+        cols = int(data_element.find("cols").text)
+        data = list(map(float, data_element.find("data").text.strip().split()))
+        return np.array(data).reshape(rows, cols)
+
+    def _get_calib_info(self):
+        """一次性加载并缓存所有相机的内外参"""
         intrinsics = []
-        for i in range(1, 8):
-            # 假设内参文件格式为stereo_calibrations_intrinsic.txt或类似格式
-            # 实际使用时需要根据WildTrack数据集的实际格式进行调整
+        extrinsics = []
+        for i in range(1, self.num_cams + 1):
             intr_path = os.path.join(self.calib_path, 'intrinsic_zero', f'intrinsic_C{i}.xml')
-            # 这里简化处理，实际应该解析XML文件
-            # 使用默认内参作为示例
-            K = np.array([
-                [1000.0, 0.0, 320.0],
-                [0.0, 1000.0, 180.0],
-                [0.0, 0.0, 1.0]
-            ])
-            intrinsics.append(torch.tensor(K, dtype=torch.float32))
-        return intrinsics
-    
-    def load_extrinsics(self):
-        """加载相机外参
-        
-        Returns:
-            dict: 包含相机外参的字典
-        """
-        extrinsics = {}
-        for i in range(1, 8):
-            # 假设外参文件格式为extrinsic.txt或类似格式
-            # 实际使用时需要根据WildTrack数据集的实际格式进行调整
             extr_path = os.path.join(self.calib_path, 'extrinsic', f'extrinsic_C{i}.xml')
-            # 这里简化处理，实际应该解析XML文件
-            # 使用默认外参作为示例
-            R = np.eye(3)  # 旋转矩阵，默认为单位矩阵
-            T = np.array([0.0, 0.0, 0.0])  # 平移向量，默认为零向量
             
-            extrinsics[f'C{i}'] = {
-                'R': torch.tensor(R, dtype=torch.float32),
-                'T': torch.tensor(T, dtype=torch.float32)
+            # 加载内参
+            K = self._parse_xml_matrix(intr_path, 'intrinsic_matrix')
+            intrinsics.append(K)
+
+            # 加载外参 (cam2world)
+            R = self._parse_xml_matrix(extr_path, 'rotation_matrix')
+            T = self._parse_xml_matrix(extr_path, 'translation_vector').flatten()
+
+            # 求逆得到世界到相机的转换 (world2cam)
+            R_inv = R.T
+            T_inv = -R.T @ T
+
+            extrinsic = np.eye(4)
+            extrinsic[:3, :3] = R_inv
+            extrinsic[:3, 3] = T_inv
+            extrinsics.append(extrinsic)
+
+        return intrinsics, extrinsics
+
+    def load_annotations(self, ann_file):
+        """加载标注文件，这里我们为每一帧生成一个数据项"""
+        # ann_file 在此场景下未使用，因为标注是按帧存储的
+        data_infos = []
+        intrinsics, extrinsics = self._get_calib_info()
+
+        for frame_id in self.frame_indices:
+            info = {
+                'frame_id': frame_id,
+                'img_filenames': [os.path.join(self.data_root, 'Image_subsets', f'C{i}', f'{frame_id:08d}.png') for i in range(1, self.num_cams + 1)],
+                'cam_intrinsics': intrinsics,
+                'cam_extrinsics': extrinsics
             }
-        return extrinsics
+
+            # 加载3D标注
+            ann_path = os.path.join(self.annotation_path, f'{frame_id:08d}.json')
+            if os.path.exists(ann_path):
+                with open(ann_path, 'r') as f:
+                    ann_data = json.load(f)
+
+                gt_bboxes_3d = []
+                gt_labels_3d = []
+                for person in ann_data:
+                    # BEVFormer需要(x, y, z, w, l, h, yaw)格式
+                    # Wildtrack只提供(x, y, z)，我们假设一个固定的包围盒尺寸和方向
+                    x, y, z = person['position3D']
+                    w, l, h = 0.8, 0.8, 1.8  # 行人平均尺寸
+                    yaw = 0  # 假设方向为0
+                    gt_bboxes_3d.append([x, y, z, w, l, h, yaw])
+                    gt_labels_3d.append(0) # 'Pedestrian' 类别
+
+                info['ann_info'] = {
+                    'gt_bboxes_3d': np.array(gt_bboxes_3d, dtype=np.float32),
+                    'gt_labels_3d': np.array(gt_labels_3d, dtype=np.int64)
+                }
+            data_infos.append(info)
+
+        return data_infos
+
+    def get_data_info(self, index):
+        """根据索引获取数据信息"""
+        info = self.data_infos[index]
+
+        # 准备BEVFormer需要的多视图格式
+        input_dict = {
+            'sample_idx': info['frame_id'],
+            'img_filename': info['img_filenames'],
+            'cam_intrinsic': info['cam_intrinsics'],
+            'lidar2cam': info['cam_extrinsics'], # 在BEVFormer中，外参通常指 lidar/world to cam
+            'ann_info': info.get('ann_info')
+        }
+        return input_dict

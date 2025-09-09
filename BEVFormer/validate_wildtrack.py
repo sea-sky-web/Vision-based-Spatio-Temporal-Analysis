@@ -1,18 +1,18 @@
 import os
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
 import sys
+from mmdet3d.apis import init_model
+from mmcv.parallel import collate, scatter
 
 # 添加自定义模块路径
 sys.path.append(os.path.abspath('.'))
 
-# 导入自定义模块
 from custom.wildtrack_dataset import CustomWildTrackDataset
-from custom.visualize_bev import visualize_bev, visualize_bev_with_annotations
+from custom.visualize_bev import visualize_bev_with_annotations
 
 def main():
-    """验证BEVFormer在WildTrack数据集上的性能"""
+    """验证BEVFormer在WildTrack数据集上的性能并生成带标注的可视化"""
     print("开始验证BEVFormer在WildTrack数据集上的性能...")
     
     # 检查CUDA是否可用
@@ -25,25 +25,19 @@ def main():
     
     # 检查文件是否存在
     if not os.path.exists(config_file):
-        print(f"错误: 配置文件 {config_file} 不存在")
+        print(f"错误: 配置文件 '{config_file}' 不存在。请确保路径正确。")
         return
     
     if not os.path.exists(checkpoint_file):
-        print(f"错误: 检查点文件 {checkpoint_file} 不存在")
-        print("请下载预训练模型: https://github.com/zhiqi-li/storage/releases/download/v1.0/bevformer_base_epoch_24.pth")
-        return
-    
-    try:
-        # 导入mmdet3d相关模块
-        from mmdet3d.apis import init_model
-    except ImportError:
-        print("错误: 无法导入mmdet3d模块，请确保已正确安装")
+        print(f"错误: 检查点文件 '{checkpoint_file}' 不存在。")
+        print("请从 https://github.com/zhiqi-li/storage/releases/download/v1.0/bevformer_base_epoch_24.pth 下载并放置在 'BEVFormer/' 目录下。")
         return
     
     try:
         # 初始化模型
         print("正在加载模型...")
         model = init_model(config_file, checkpoint_file, device=device)
+        model.eval()
         print("模型加载成功")
         
         # 创建数据集实例
@@ -51,36 +45,60 @@ def main():
         dataset = CustomWildTrackDataset(data_root='data/Wildtrack/')
         
         # 准备测试数据（第一帧）
-        print("正在准备测试数据...")
         frame_id = 0  # 使用第一帧进行测试
+        print(f"正在准备第 {frame_id} 帧的测试数据...")
         data = dataset.prepare_test_data(frame_id)
-        
-        # 将数据移动到设备上
-        if isinstance(data['img'], np.ndarray):
-            data['img'] = torch.from_numpy(data['img']).permute(0, 3, 1, 2).float().to(device)
+
+        # 转换数据格式以适应模型输入
+        img_metas = [data['img_metas']]
+        img = torch.from_numpy(data['img']).permute(0, 3, 1, 2).float().unsqueeze(0) # 增加batch维度
         
         # 提取BEV特征
-        print("正在提取BEV特征...")
+        print("正在提取真实的BEV特征...")
         with torch.no_grad():
-            # 前向传播，获取BEV特征
-            # 注意：这里的实现可能需要根据BEVFormer的实际API进行调整
-            result = model.extract_feat(img=data['img'], img_metas=data['img_metas'])
+            # BEVFormer的正确推理流程
+            # 我们需要调用 forward 并从中提取 bev_embed
+            result = model.forward(img=[img], img_metas=[img_metas], return_loss=False)
             
-            # 假设bev_feature是一个字典，包含'bev_feature'键
-            if isinstance(bev_feature, dict) and 'bev_feature' in bev_feature:
-                bev_feature = bev_feature['bev_feature']
-            elif isinstance(bev_feature, tuple) and len(bev_feature) > 0:
-                # 如果是元组，取最后一个元素作为BEV特征
-                bev_feature = bev_feature[-1]
+            # BEV特征通常存储在 'bev_embed' 键中
+            # 它的形状是 [1, H*W, C] 或 [1, C, H, W]，需要根据模型调整
+            if 'bev_embed' in result:
+                bev_embed = result['bev_embed']
+
+                # 如果是 [1, H*W, C] 格式, 转换为 [1, C, H, W]
+                if bev_embed.dim() == 3:
+                    bev_h = model.pts_bbox_head.bev_h
+                    bev_w = model.pts_bbox_head.bev_w
+                    bev_embed = bev_embed.permute(0, 2, 1).view(1, -1, bev_h, bev_w)
+            else:
+                raise ValueError("无法在模型输出中找到 'bev_embed'。请检查模型结构或输出。")
+
+        # 可视化BEV特征并叠加标注
+        print("正在可视化BEV特征并叠加3D标注...")
         
-        # 可视化BEV特征
-        print("正在可视化BEV特征...")
-        visualize_bev(bev_feature, save_path='test_bev.png')
+        # 定义BEV空间范围和尺寸，用于坐标转换
+        # 这些值应与配置文件中的 'pc_range' 和 'bev_h'/'bev_w' 匹配
+        pc_range = model.pts_bbox_head.pc_range  # [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+        bev_height = model.pts_bbox_head.bev_h
+        bev_width = model.pts_bbox_head.bev_w
+
+        visualize_bev_with_annotations(
+            bev_embed,
+            data['annotations'],
+            pc_range=pc_range,
+            bev_height=bev_height,
+            bev_width=bev_width,
+            save_path='test_bev_with_annotations.png'
+        )
         
-        print("验证完成！请查看test_bev.png文件以检查BEV特征图")
+        print("\n验证完成！")
+        print("请查看 'test_bev_with_annotations.png' 文件以检查带标注的BEV热力图。")
         
+    except FileNotFoundError as e:
+        print(f"\n错误: {e}")
+        print("这通常意味着数据文件或符号链接不正确。请仔细检查 '数据准备' 步骤。")
     except Exception as e:
-        print(f"验证过程中出现错误: {e}")
+        print(f"\n验证过程中出现严重错误: {e}")
         import traceback
         traceback.print_exc()
 
