@@ -1,0 +1,1 @@
+This directory stores training checkpoints: last.pth and best.pth.
