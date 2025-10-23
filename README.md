@@ -1,153 +1,126 @@
-# Vision-based Spatio-Temporal Analysis (Multi-View to BEV)
+# BEV-PedTrack: 面向固定场景的多视角行人感知系统
 
-本工程基于 [BEVFormer](https://github.com/fundamentalvision/BEVFormer) 开源框架，旨在快速验证多视角图像到鸟瞰视图（BEV）表征的融合效果，特别针对复杂场景（如交通枢纽）下的行人检测、跟踪和分析。
+**BEV-PedTrack: A Multi-View Pedestrian Perception System for Static Scenes using Geometric BEV Fusion**
 
-## 项目简介
+## 摘要 (Abstract)
 
-BEVFormer 是一个强大的、基于 Transformer 的模型，能够将来自多个摄像头的图像输入，通过空间跨注意力和时间自注意力机制，将其融合成一个统一的时空鸟瞰视图（BEV）表征。
+本项目旨在开发一个高效、轻量化的多视角行人感知系统，专门针对交通枢纽、广场、园区等拥有固定摄像头的监控场景。传统方法通常在各个2D视角独立进行检测，再进行复杂的跨镜头目标匹配（Re-ID），这种“后期融合”的策略在人群拥挤和频繁遮挡的场景下表现不佳。
 
-本项目利用 BEVFormer 的强大能力，在 [Wildtrack 数据集](https://www.epfl.ch/labs/cvlab/data/data-wildtrack/) 上进行算法验证，以解决多视角场景下的目标遮挡和跨视角一致性问题。
+为解决此问题，本项目采用**“先融合、后检测” (Fuse-before-Detect)** 的核心思想。我们利用已知的相机几何标定参数，通过逆透视变换（IPM）将来自多个视角的**深度特征图**直接投影并融合到统一的鸟瞰图（BEV）空间。所有后续的感知任务，如行人检测、跟踪和轨迹预测，都在这个信息丰富的、全局统一的BEV表征上进行。这种方法从根本上规避了跨镜头Re-ID的难题，并能有效利用多视角信息来应对遮挡。
 
-## 项目结构
+本项目将以模块化的方式，使用现代化的深度学习框架（PyTorch 2.x, `timm`, `OpenCV`）进行构建，确保代码的健壮性、可读性和可扩展性。
 
+## 核心特性 (Key Features)
+
+* **BEV中心化设计**: 所有感知任务均在统一的BEV“上帝视角”下完成，天然解决了多视角数据不一致的问题。
+* **几何感知，而非3D预测**: 充分利用静态场景中已知的相机几何关系，通过高效的IPM进行视图变换，而非采用复杂的、为自动驾驶设计的深度预测或3D空间推断网络，更加轻量高效。
+* **天生免除Re-ID**: 通过在检测前融合多视角特征，从架构上消除了在2D图像空间进行跨镜头目标匹配的需要。
+* **抗遮挡性**: 融合后的BEV特征可以综合利用不同视角的信息，一个视角中的遮挡可以被其他视角的信息所弥补。
+* **现代化与模块化**: 基于最新的、稳定的深度学习库构建，代码结构清晰，易于迭代和扩展。
+
+## 技术架构 (Technical Architecture)
+
+系统遵循一个清晰的、端到端的流水线设计：
+
+![Pipeline Diagram](https://i.imgur.com/your-pipeline-diagram-placeholder.png)  1.  **输入 (Input)**:
+    * 来自N个同步摄像头的图像帧 (N x H x W x C)。
+    * 每个摄像头的内外参标定文件。
+
+2.  **2D特征提取 (Backbone)**:
+    * 每个图像帧独立通过一个轻量级的骨干网络 (如 ResNet, EfficientNet) 提取多尺度2D特征图。
+
+3.  **视图投影 (View Projection via IPM)**:
+    * 利用相机参数计算单应性矩阵 (Homography Matrix)。
+    * 使用OpenCV对2D特征图进行逆透视变换，将其“拍扁”并投影到预定义的BEV世界坐标系下的虚拟“地面”上。
+
+4.  **BEV特征融合 (BEV Fusion)**:
+    * 将来自N个摄像头的BEV特征图进行融合，生成一张单一的、信息增强的BEV特征图。
+
+5.  **下游任务头 (Downstream Heads)**:
+    * 在融合后的BEV特征图上，接入不同的任务头来完成特定任务：
+        * **检测头 (Detection Head)**: 输出行人在BEV空间中的位置（例如，通过热力图）。
+        * **跟踪模块 (Tracking Module)**: 将连续帧的检测结果关联起来，形成运动轨迹。
+
+## 开发路线图 (Development Roadmap)
+
+本项目将分阶段进行，确保每一步都稳固可靠。
+
+### Phase 1: v1.0 - 核心架构验证
+
+* **目标**: 搭建并跑通从多视角图像输入到融合BEV特征图输出的核心流程，验证技术路线的可行性。
+* **核心任务**:
+    1.  使用 `timm` 库实现2D特征提取。
+    2.  使用 `OpenCV` 实现特征图的IPM投影。
+    3.  实现最简单的BEV特征融合方法：**逐像素相加/平均**。
+* **成功标准**: 能够稳定输入多路Wildtrack图像，并输出一张视觉上清晰、合理的融合BEV特征图。**此阶段不要求实现检测头和注意力机制。**
+
+### Phase 2: v2.0 - 智能融合与检测
+
+* **目标**: 提升BEV特征质量，并实现端到端的行人检测。
+* **核心任务**:
+    1.  将v1.0的简单融合模块，升级为基于**可变形注意力机制 (Deformable Attention)** 的智能融合模块，借鉴MVDeTr的思想。
+    2.  在融合后的BEV特征图上，实现一个简单的检测头（如 CenterNet-style 的热力图检测头）。
+* **成功标准**: 模型能够端到端训练，并在BEV图上输出准确的行人检测热点。
+
+### Phase 3: v3.0 - 完整跟踪系统
+
+* **目标**: 构建完整的、端到端的BEV多目标跟踪系统。
+* **核心任务**:
+    1.  在v2.0的检测结果基础上，集成一个轻量级的在线跟踪算法（如 SORT 或 DeepSORT 的变体）。
+    2.  端到端优化整个模型，提升MODA/MODP等MCMT评价指标。
+* **成功标准**: 系统能够稳定输出带有时序和ID信息的行人轨迹。
+
+## 数据集 (Dataset)
+
+本项目主要面向**Wildtrack**及其同类数据集。这类数据集必须提供：
+* 同步的多视角视频帧。
+* 每个摄像头的内外参数（相机矩阵、畸变系数、旋转和平移矩阵）。
+
+## 环境设置 (Setup & Installation)
+
+```bash
+# 1. 创建并激活Conda环境 (推荐)
+conda create -n bev_pedtrack python=3.10 -y
+conda activate bev_pedtrack
+
+# 2. 安装 PyTorch (请根据你的CUDA版本访问PyTorch官网获取对应命令)
+# 例如 CUDA 12.1:
+pip3 install torch torchvision torchaudio --index-url [https://download.pytorch.org/whl/cu121](https://download.pytorch.org/whl/cu121)
+
+# 3. 安装核心依赖
+pip install timm         # 用于加载骨干网络
+pip install opencv-python  # 用于图像处理和IPM
+pip install numpy
+pip install matplotlib   # 用于可视化
+
+# 4. (可选) 安装ultralytics用于性能对比
+pip install ultralytics
 ```
-.
-├── BEVFormer/               # BEVFormer 核心代码、配置和自定义脚本
-│   ├── custom/              # 本项目的自定义模块
-│   │   ├── wildtrack_dataset.py  # Wildtrack 数据集加载器
-│   │   └── visualize_bev.py      # BEV 特征图可视化工具
-│   ├── projects/configs/    # 模型和数据集配置文件
-│   ├── validate_wildtrack.py # 用于验证和可视化的主脚本
-│   └── requirements.txt     # Python 依赖项列表
-├── README.md                # 本文档
-...
+
+## 使用方法 (Usage)
+
+*(待代码实现后填充)*
+
+### 训练 (Training)
+
+```bash
+python train.py --config configs/wildtrack_v1_resnet50.yaml
 ```
 
-## 1. 环境搭建
+### 推理 (Inference)
 
-为了确保兼容性并避免潜在的依赖冲突，强烈建议使用 `conda` 创建一个独立的 **Python 3.8** 虚拟环境。
+```bash
+python inference.py --config configs/wildtrack_v1_resnet50.yaml --input_path /path/to/your/image_folders --output_path /path/to/save/bev_map
+```
 
-### 系统要求
-- **Python 3.8 (强制)**
-- PyTorch 1.9.0+
-- CUDA 11.1+
+## 未来工作 (Future Work)
 
-### 安装步骤
+* 集成轨迹预测模块，实现行人未来位置的预测。
+* 对模型进行实时性优化，探索知识蒸馏、模型剪枝等技术。
+* 将系统扩展到更复杂的场景，如存在高度变化的非平面场景。
 
-1.  **克隆本项目:**
-    ```bash
-    git clone <repository-url>
-    cd Vision-based-Spatio-Temporal-Analysis
-    ```
+## 参考 (References)
 
-2.  **创建并激活 Conda 环境:**
-    ```bash
-    conda create -n bevformer-wildtrack python=3.8
-    conda activate bevformer-wildtrack
-    ```
-
-3.  **安装核心依赖 (PyTorch, MMCV, MMDetection):**
-    *为了避免因本地编译耗时过长或失败，我们提供了一系列使用预编译包的命令。请严格按照以下步骤执行。*
-
-    a. **安装 PyTorch:**
-    ```bash
-    # 适用于 CUDA 11.1 的版本
-    pip install torch==1.9.0+cu111 torchvision==0.10.0+cu111 torchaudio==0.7.2 -f https://download.pytorch.org/whl/torch_stable.html
-    ```
-
-    b. **安装 MMCV:**
-    ```bash
-    pip install mmcv-full==1.3.17 -f https://download.openmmlab.com/mmcv/dist/cu111/torch1.9.0/index.html
-    ```
-
-    c. **安装 MMDetection:**
-    ```bash
-    pip install mmdet==2.14.0
-    ```
-
-    d. **安装 MMDetection3D:**
-    ```bash
-    pip install mmdet3d==0.14.0
-    ```
-
-4.  **安装其他依赖项:**
-    ```bash
-    cd BEVFormer
-    pip install -r requirements.txt
-    cd ..
-    ```
-
-## 2. 数据准备
-
-1.  **下载 Wildtrack 数据集**:
-    从 [Wildtrack 官网](https://www.epfl.ch/labs/cvlab/data/data-wildtrack/)下载数据集，并将其解压。
-
-2.  **放置数据集**:
-    将解压后的数据集内容放置在 `BEVFormer/data/Wildtrack_dataset/` 目录下。
-
-3.  **创建数据符号链接**:
-    为了让代码能正确找到数据，需要在 `BEVFormer/` 目录下创建一个指向数据集的符号链接。
-    -   **Windows (以管理员身份运行命令提示符):**
-        ```cmd
-        cd BEVFormer
-        mklink /D data\Wildtrack ..\data\Wildtrack_dataset
-        cd ..
-        ```
-    -   **Linux / macOS:**
-        ```bash
-        cd BEVFormer
-        ln -s ../data/Wildtrack_dataset data/Wildtrack
-        cd ..
-        ```
-
-## 3. 预训练模型
-
-1.  **下载 BEVFormer 预训练权重**:
-    验证脚本需要 `bevformer_base_epoch_24.pth` 模型权重。
-    从 [官方发布页面](https://github.com/zhiqi-li/storage/releases/download/v1.0/bevformer_base_epoch_24.pth) 下载。
-
-2.  **放置模型文件**:
-    将下载的 `.pth` 文件移动到 `BEVFormer/` 目录下。
-
-## 4. 运行与验证
-
-本项目提供了一个主脚本 `validate_wildtrack.py` 用于运行验证和生成可视化结果。
-
-1.  **进入 `BEVFormer` 目录:**
-    ```bash
-    cd BEVFormer
-    ```
-
-2.  **运行验证脚本:**
-    ```bash
-    python validate_wildtrack.py
-    ```
-
-脚本将自动执行以下操作:
-1.  加载预训练的 BEVFormer 模型和自定义配置。
-2.  加载 Wildtrack 数据集的第一帧图像及相机参数。
-3.  通过模型推理，生成 BEV 特征图。
-4.  将 BEV 特征图可视化，并保存为 `test_bev.png`。
-
-### 预期结果
-成功运行后，将在 `BEVFormer/` 目录下生成 `test_bev.png` 文件。该图像是一个热力图，展示了场景的 BEV 表征。从图中可以直观地观察到行人的分布情况，从而验证多视角融合的效果。
-
-## 注意事项
-
-- 本项目当前仅用于**快速验证**，不包含模型训练部分。
-- 使用的预训练模型基于 nuScenes 数据集，在 Wildtrack 数据集上可能不是最优的，需要进一步微调才能达到更好的性能。
-- 相机参数的解析逻辑位于 `custom/wildtrack_dataset.py` 中，可能需要根据实际的数据格式进行调整。
-
-## 常见问题
-
-1.  **安装 `mmcv-full` 或 `mmdet3d` 失败/超时:**
-    - **原因**: 这通常是由于本地环境缺少编译工具链或网络问题导致无法直接从源码编译。
-    - **解决方案**: 请严格遵循 `1. 环境搭建` 中提供的命令，通过 `-f` 参数指定预编译包的下载地址，可以避免本地编译。
-
-2.  **`ModuleNotFoundError: No module named 'numpy.distutils'`:**
-    - **原因**: 这个问题出现在较新的 `numpy` 版本（>=1.22）中，因为 `distutils` 已被移除。项目依赖的 `numba==0.48.0` 需要此模块。
-    - **解决方案**: 确保您使用的是 **Python 3.8** 环境。在此环境下，`pip` 会自动安装与 `numba==0.48.0` 兼容的 `numpy` 版本。
-
-3.  **`AttributeError: module 'configparser' has no attribute 'SafeConfigParser'`:**
-    - **原因**: `SafeConfigParser` 在 Python 3.12 中已被移除。
-    - **解决方案**: 这是环境不兼容的典型表现。请务必使用 **Python 3.8**。
+* [MVDeT: Multi-view Detection with Transformer](https://arxiv.org/abs/2104.14592)
+* [MVDeTr: Multi-view Detection Transformer for 3D Object Detection](https://arxiv.org/abs/2110.05214)
+* [Wildtrack: A Multi-camera HD Dataset for Dense Unscripted Pedestrian Detection](https://arxiv.org/abs/1710.10103)

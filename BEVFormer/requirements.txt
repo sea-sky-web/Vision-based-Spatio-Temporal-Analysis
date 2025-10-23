@@ -8,8 +8,8 @@
 # For more details, visit: https://pytorch.org/get-started/locally/
 
 # Core deep learning framework
-torch==2.3.1
-torchvision==0.18.1
+torch>=2.6.0
+torchvision>=0.15.0
 
 # Pre-trained model library for feature extraction
 timm==1.0.3
@@ -22,3 +22,7 @@ numpy==1.26.4
 
 # Library for plotting and visualization
 matplotlib==3.8.4
+ 
+# Geometry vision ops for warp_perspective
+kornia==0.7.2
+kornia>=0.7

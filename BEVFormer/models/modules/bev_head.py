@@ -13,4 +13,11 @@ class SimpleBEVHead(nn.Module):
         )
 
     def forward(self, x):
-        return self.net(x)
+        out = self.net(x)
+        # debug prints: shapes and stats
+        try:
+            print(f"[BEVHead] in shape: {tuple(x.shape)}, out shape: {tuple(out.shape)}")
+            print(f"[BEVHead] out stats: min={out.min().item():.4f}, max={out.max().item():.4f}, mean={out.mean().item():.4f}")
+        except Exception:
+            print(f"[BEVHead] out type: {type(out)}")
+        return out
