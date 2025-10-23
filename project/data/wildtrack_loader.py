@@ -9,6 +9,40 @@ import torchvision.transforms as T
 
 from .transforms import build_transforms
 
+import math
+import json
+from typing import Optional, Tuple, List, Dict, Any
+
+# Geometry helpers: pure functions for image↔world on ground plane
+# Keep these IO-free and idempotent; no prints or side effects.
+def _compute_homography(K: torch.Tensor, Rt: torch.Tensor) -> torch.Tensor:
+    R = Rt[:3, :3]
+    t = Rt[:3, 3:4]
+    H = torch.eye(3, dtype=torch.float32)
+    H[:, :2] = R[:, :2]
+    H[:, 2:3] = t
+    return K @ H
+
+
+def _compute_img_to_world_homography(K: torch.Tensor, Rt: torch.Tensor) -> torch.Tensor:
+    H_w2i = _compute_homography(K, Rt)
+    try:
+        return torch.linalg.inv(H_w2i)
+    except Exception:
+        return torch.linalg.pinv(H_w2i)
+
+
+def _pixel_to_world(u: float, v: float, K: torch.Tensor, Rt: torch.Tensor) -> Optional[Tuple[float, float]]:
+    H_i2w = _compute_img_to_world_homography(K, Rt)
+    uv1 = torch.tensor([u, v, 1.0], dtype=torch.float32).reshape(3, 1)
+    xyw = H_i2w @ uv1
+    w = float(xyw[2, 0])
+    if not (w == w) or abs(w) < 1e-8:
+        return None
+    x = float(xyw[0, 0] / w)
+    y = float(xyw[1, 0] / w)
+    return (x, y)
+
 
 def _parse_float_list(text: str) -> List[float]:
     """Parse a list of floats from a free-form text string (comma/space/semi/line separated)."""
@@ -176,12 +210,36 @@ def _load_wildtrack_calibrations(calib_root: Path, views: int) -> Tuple[List[tor
                 t = _try_get_matrix(root_ex, ['T','translation','TranslationVector','t'], (3,1))
                 if R is not None and t is not None:
                     Rt34 = torch.cat([R, t], dim=1)
+                else:
+                    # Try OpenCV rvec/tvec format
+                    rvec = _try_get_matrix(root_ex, ['rvec','Rodrigues','rotation_vector'], (3,1))
+                    if rvec is None:
+                        rvec = _try_get_matrix(root_ex, ['rvec','Rodrigues','rotation_vector'], (1,3))
+                    tvec = _try_get_matrix(root_ex, ['tvec','t','translation_vector'], (3,1))
+                    if tvec is None:
+                        tvec = _try_get_matrix(root_ex, ['tvec','t','translation_vector'], (1,3))
+                    if (rvec is not None) and (tvec is not None):
+                        R = _rodrigues(rvec)
+                        t = tvec.reshape(3,1)
+                        Rt34 = torch.cat([R, t], dim=1)
             if Rt34 is None:
                 print(f"[WildtrackDataset] 警告: 相机 {name} 的外参XML未解析到Rt，使用单位Rt: {extr_match}")
                 Rt = torch.eye(4, dtype=torch.float32)
             else:
                 Rt = torch.eye(4, dtype=torch.float32)
                 Rt[:3, :4] = Rt34
+                # 单位归一：若 t 范数很大，假定为毫米，统一为米
+                t_norm_cur = float(torch.norm(Rt[:3, 3]))
+                if t_norm_cur > 100.0:
+                    Rt[:3, 3] = Rt[:3, 3] / 1000.0
+                # Log a brief summary of rotation angle and translation norm
+                try:
+                    R_part = Rt[:3, :3]
+                    angle = float(torch.arccos(torch.clamp(((torch.trace(R_part) - 1.0) / 2.0), -1.0, 1.0)))
+                    t_norm = float(torch.norm(Rt[:3, 3]))
+                    print(f"[WildtrackDataset] 解析外参: {name} angle={angle:.3f} rad t_norm={t_norm:.3f}")
+                except Exception:
+                    pass
 
         Ks.append(K)
         Rts.append(Rt)
@@ -231,8 +289,69 @@ class WildtrackDataset(torch.utils.data.Dataset):
         self.intrinsics = [Ks for _ in range(len(self.frame_files))]
         self.extrinsics = [Rts for _ in range(len(self.frame_files))]
 
+        # 选择标注目录（优先 annotations_positions）
+        ann_candidates = [
+            self.data_root / 'annotations_positions',
+            self.data_root / 'Annotations',
+            self.data_root / 'annotations',
+        ]
+        self.annotations_dir = next((d for d in ann_candidates if d.exists()), None)
+
+        # 预解析每帧标注为世界坐标中心
+        self.targets_per_frame: List[Dict[str, Any]] = []
+        self._prepare_targets()
+
     def __len__(self):
         return len(self.frame_files)
+
+    # 使用模块级几何辅助函数，避免实例方法绑定与额外开销
+    def _prepare_targets(self):
+        Ks0 = self.intrinsics[0] if len(self.intrinsics) > 0 else []
+        Rts0 = self.extrinsics[0] if len(self.extrinsics) > 0 else []
+        has_ann = self.annotations_dir is not None
+        for idx, fname in enumerate(self.frame_files):
+            centers = []
+            if has_ann:
+                stem = Path(fname).stem
+                json_path = self.annotations_dir / (stem + '.json')
+                if json_path.exists():
+                    try:
+                        with open(json_path, 'r') as f:
+                            data = json.load(f)
+                        if isinstance(data, dict) and 'annotations' in data:
+                            for ann in data['annotations']:
+                                wp = ann.get('world_pos', None)
+                                if wp and len(wp) >= 2:
+                                    centers.append([float(wp[0]), float(wp[1])])
+                        elif isinstance(data, list):
+                            for person in data:
+                                pts_world = []
+                                for view in person.get('views', []):
+                                    vnum = int(view.get('viewNum', -1))
+                                    if vnum < 0 or vnum >= len(Ks0):
+                                        continue
+                                    xmin = view.get('xmin', None); xmax = view.get('xmax', None)
+                                    ymin = view.get('ymin', None); ymax = view.get('ymax', None)
+                                    if None in (xmin, xmax, ymin, ymax):
+                                        continue
+                                    u = 0.5 * (float(xmin) + float(xmax))
+                                    v = float(ymax)
+                                    wp = _pixel_to_world(u, v, Ks0[vnum], Rts0[vnum])
+                                    if wp is not None:
+                                        pts_world.append(wp)
+                                if len(pts_world) > 0:
+                                    x_mean = sum(p[0] for p in pts_world) / len(pts_world)
+                                    y_mean = sum(p[1] for p in pts_world) / len(pts_world)
+                                    centers.append([x_mean, y_mean])
+                    except Exception as e:
+                        print(f"[WildtrackDataset] 解析标注失败: {json_path} ({e})")
+            centers_t = torch.tensor(centers, dtype=torch.float32) if len(centers) > 0 else torch.zeros(0, 2)
+            self.targets_per_frame.append({
+                'boxes_world': torch.zeros(0, 4),
+                'centers_world': centers_t,
+                'keypoints': None,
+                'calib': {'intrinsic': self.intrinsics[idx], 'extrinsic': self.extrinsics[idx]},
+            })
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         imgs = []
@@ -248,7 +367,7 @@ class WildtrackDataset(torch.utils.data.Dataset):
             'intrinsic': self.intrinsics[idx],
             'extrinsic': self.extrinsics[idx],
         }
-        targets = {
+        targets = self.targets_per_frame[idx] if (self.targets_per_frame and idx < len(self.targets_per_frame)) else {
             'boxes_world': torch.zeros(0, 4),
             'centers_world': torch.zeros(0, 2),
             'keypoints': None,
@@ -271,3 +390,17 @@ def collate_fn(batch: List[Dict[str, Any]]):
         'targets': targets,
         'meta': meta,
     }
+
+
+def _rodrigues(rvec: torch.Tensor) -> torch.Tensor:
+    # rvec: shape (3,) or (3,1) or (1,3)
+    rv = rvec.reshape(-1).to(torch.float32)
+    theta = torch.norm(rv).item()
+    if theta < 1e-8:
+        return torch.eye(3, dtype=torch.float32)
+    k = rv / theta
+    kx, ky, kz = k[0].item(), k[1].item(), k[2].item()
+    K = torch.tensor([[0.0, -kz, ky], [kz, 0.0, -kx], [-ky, kx, 0.0]], dtype=torch.float32)
+    I = torch.eye(3, dtype=torch.float32)
+    R = I + math.sin(theta) * K + (1.0 - math.cos(theta)) * (K @ K)
+    return R
