@@ -1,0 +1,10 @@
+tracker:
+  emb_dim: 128
+  max_age: 5
+  space_weight: 0.6
+  app_weight: 0.4
+  space_thresh: 2.0
+  app_thresh: 0.6
+  reid_alpha: 0.2
+  motion_model: linear
+  use_kalman: false
