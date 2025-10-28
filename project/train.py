@@ -9,10 +9,12 @@ from torch.utils.data import DataLoader, random_split
 from data.wildtrack_loader import WildtrackDataset, collate_fn
 from models.model_wrapper import BEVNet
 from utils.visualization import save_bev_heatmap
+from typing import List, Dict
 
 
 def load_cfg(path: str):
-    with open(path, 'r') as f:
+    # Ensure UTF-8 to support comments and non-ASCII characters in YAML
+    with open(path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 
 
@@ -72,10 +74,18 @@ def main():
     device = torch.device(cfg['RUNTIME']['DEVICE'] if torch.cuda.is_available() else 'cpu')
 
     ds = WildtrackDataset(cfg)
-    val_ratio = 0.2
-    n_val = int(len(ds) * val_ratio)
-    n_train = len(ds) - n_val
-    train_ds, val_ds = random_split(ds, [n_train, n_val])
+    # Wildtrack精简规范：固定切分 train/val=400/100（若总帧不足则回退随机切分）
+    total = len(ds)
+    if total >= 500:
+        indices_train = list(range(0, 400))
+        indices_val = list(range(400, 500))
+        train_ds = torch.utils.data.Subset(ds, indices_train)
+        val_ds = torch.utils.data.Subset(ds, indices_val)
+    else:
+        val_ratio = 0.2
+        n_val = int(total * val_ratio)
+        n_train = total - n_val
+        train_ds, val_ds = random_split(ds, [n_train, n_val])
 
     dl_train = DataLoader(train_ds, batch_size=cfg['DATA']['BATCH_SIZE'], shuffle=True,
                           num_workers=cfg['RUNTIME']['NUM_WORKERS'], collate_fn=collate_fn)
@@ -92,15 +102,49 @@ def main():
     save_dir = os.path.join(os.path.dirname(args.config), '..', cfg['RUNTIME']['SAVE_DIR']).replace('\\', '/')
     os.makedirs(save_dir, exist_ok=True)
 
+    def _summarize_batch_gt(targets: List[Dict]) -> str:
+        counts = []
+        for t in targets:
+            n_boxes = int(t.get('boxes_world', torch.zeros(0,4)).shape[0]) if t.get('boxes_world', None) is not None else 0
+            centers = t.get('centers_world', None)
+            n_centers = int(centers.shape[0]) if centers is not None else 0
+            counts.append(max(n_boxes, n_centers))
+        return f"GT per-sample: {counts} | total={sum(counts)}"
+    
+    
+    def _summarize_calib(calib: Dict) -> str:
+        # calib['intrinsic'] and calib['extrinsic'] are List[List[Tensor]] of shape [B][V]
+        if not isinstance(calib.get('intrinsic', None), list) or len(calib['intrinsic']) == 0:
+            return "Rt angles(rad): [] | t_norms: []"
+        K_views = calib['intrinsic'][0]
+        Rt_views = calib['extrinsic'][0]
+        angles = []
+        tnorms = []
+        for Rt in Rt_views:
+            try:
+                R = Rt[:3, :3]
+                angle = float(torch.arccos(torch.clamp(((torch.trace(R) - 1.0) / 2.0), -1.0, 1.0)))
+                tnorm = float(torch.norm(Rt[:3, 3]))
+            except Exception:
+                angle, tnorm = float('nan'), float('nan')
+            angles.append(round(angle, 3))
+            tnorms.append(round(tnorm, 3))
+        return f"Rt angles(rad): {angles} | t_norms: {tnorms}"
+
     for epoch in range(cfg['TRAIN']['EPOCHS']):
         model.train()
         running_loss = 0.0
+        first_batch_logged = False
         for batch in dl_train:
             batch['images'] = batch['images'].to(device)
             # move calib tensors to device
             for b in range(len(batch['calib']['intrinsic'])):
                 batch['calib']['intrinsic'][b] = [k.to(device) for k in batch['calib']['intrinsic'][b]]
                 batch['calib']['extrinsic'][b] = [e.to(device) for e in batch['calib']['extrinsic'][b]]
+            if not first_batch_logged:
+                print(f"[Train][Epoch {epoch}] { _summarize_batch_gt(batch['targets']) }")
+                print(f"[Train][Epoch {epoch}] { _summarize_calib(batch['calib']) }")
+                first_batch_logged = True
             preds = model(batch)
             loss_dict = model.loss(preds, batch['targets'], cfg['LOSS'])
             loss = loss_dict['total_loss']
@@ -114,13 +158,19 @@ def main():
         model.eval()
         with torch.no_grad():
             precisions, recalls, f1s, mles = [], [], [], []
+            first_val_logged = False
             for batch in dl_val:
                 batch['images'] = batch['images'].to(device)
                 for b in range(len(batch['calib']['intrinsic'])):
                     batch['calib']['intrinsic'][b] = [k.to(device) for k in batch['calib']['intrinsic'][b]]
                     batch['calib']['extrinsic'][b] = [e.to(device) for e in batch['calib']['extrinsic'][b]]
+                if not first_val_logged:
+                    print(f"[Val][Epoch {epoch}] { _summarize_batch_gt(batch['targets']) }")
+                    print(f"[Val][Epoch {epoch}] { _summarize_calib(batch['calib']) }")
+                    first_val_logged = True
                 preds = model(batch)
-                p, r, f1, mle = compute_metrics(preds['boxes'], batch['targets'])
+                # 评估使用thr=0.4, NMS=0.5m已在forward/decode中处理
+                p, r, f1, mle = compute_metrics(preds['boxes'], batch['targets'], match_dist=cfg['EVAL']['NMS_DIST_M'])
                 precisions.append(p); recalls.append(r); f1s.append(f1); mles.append(mle)
                 if args.save_vis:
                     save_bev_heatmap(preds['heatmap'], os.path.join(cfg['RUNTIME']['OUTPUT_DIR'], f'epoch{epoch}_hm.png'))

@@ -1,31 +1,33 @@
 DATA:
   BATCH_SIZE: 2
-  IMG_SIZE: [3, 256, 256]
+  IMG_SIZE: [3, 270, 480]
   VIEWS: 7
   DATA_ROOT: "project/Data/Wildtrack"
 
 MODEL:
-  BACKBONE: "resnet18"
-  FEAT_DIM: 32
-  BEV_SIZE: [32, 128, 128]
-  BEV_BOUNDS: [-6.0, 6.0, -2.0, 2.0]
+  BACKBONE: "efficientnet_b0"
+  PRETRAINED: false  # 若网络可用可改为 true
+  FEAT_DIM: 1280
+  OUT_INDEX: 2  # 选择输出stride≈4的特征层
+  BEV_SIZE: [32, 120, 360]
+  BEV_BOUNDS: [-24.0, 24.0, -7.2, 7.2]
 
 TRAIN:
-  EPOCHS: 30
+  EPOCHS: 50
   LR: 1e-3
-  OPT: "AdamW"
+  OPT: "Adam"
   WEIGHT_DECAY: 1e-4
   LR_SCHEDULER: "step"  # or "cosine"
 
 LOSS:
-  CLS_WEIGHT: 1.0
-  REG_WEIGHT: 1.0
-  GEOM_WEIGHT: 0.5
-  FOCAL_ALPHA: 0.25
-  FOCAL_GAMMA: 2.0
+  GT_SIGMA_PX: 1.0
 
 RUNTIME:
   DEVICE: "cuda"
   NUM_WORKERS: 4
   SAVE_DIR: "checkpoints/"
   OUTPUT_DIR: "data/outputs/"
+
+EVAL:
+  CONF_THRESH: 0.4
+  NMS_DIST_M: 0.5

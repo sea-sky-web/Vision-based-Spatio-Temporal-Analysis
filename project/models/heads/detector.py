@@ -7,10 +7,16 @@ from typing import Dict, Tuple
 class BEVDetector(nn.Module):
     def __init__(self, in_channels: int = 32, heatmap_sigma: float = 2.0, bev_bounds: Tuple[float, float, float, float] = (-6.0, 6.0, -2.0, 2.0)):
         super().__init__()
+        # 3层扩张卷积 + GroupNorm，较大感受野
+        mid1, mid2 = 512, 128
         self.head = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.Conv2d(in_channels, mid1, kernel_size=3, padding=1, dilation=1, bias=False),
+            nn.GroupNorm(num_groups=32, num_channels=mid1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels, 1, 1)
+            nn.Conv2d(mid1, mid2, kernel_size=3, padding=2, dilation=2, bias=False),
+            nn.GroupNorm(num_groups=32, num_channels=mid2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid2, 1, kernel_size=3, padding=4, dilation=4)
         )
         self.heatmap_sigma = heatmap_sigma
         self.bounds = bev_bounds
@@ -27,7 +33,7 @@ class BEVDetector(nn.Module):
         keep = (x == maxpool).float()
         return x * keep
 
-    def decode(self, heatmap: torch.Tensor, conf_thresh: float = 0.4, box_size_m: Tuple[float, float] = (0.6, 0.6)):
+    def decode(self, heatmap: torch.Tensor, conf_thresh: float = 0.4, box_size_m: Tuple[float, float] = (0.6, 0.6), nms_dist_m: float = 0.5):
         """Decode peaks to BEV box centers, returns boxes in meters.
         heatmap: [B,1,H,W]
         """
@@ -58,6 +64,22 @@ class BEVDetector(nn.Module):
                 boxes = torch.zeros(0, 4)
             else:
                 boxes = torch.stack([cx, cy, torch.full_like(cx, w_m), torch.full_like(cx, h_m)], dim=1)
+            # 简单BEV NMS：按中心距离>nms_dist_m保留最高分
+            if boxes.shape[0] > 1:
+                order = torch.argsort(scores, descending=True)
+                keep = []
+                centers = boxes[:, :2]
+                for idx in order:
+                    c = centers[idx]
+                    too_close = False
+                    for k in keep:
+                        if torch.norm(centers[k] - c).item() < nms_dist_m:
+                            too_close = True
+                            break
+                    if not too_close:
+                        keep.append(int(idx))
+                boxes = boxes[keep]
+                scores = scores[keep]
             boxes_list.append(boxes)
             scores_out.append(scores)
         return boxes_list, scores_out

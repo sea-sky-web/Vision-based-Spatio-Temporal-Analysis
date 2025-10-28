@@ -34,3 +34,13 @@ class AttentionFusion(FusionModule):
             self._warned = True
         # simple fallback
         return bev_maps.mean(dim=1)
+
+
+class ConcatFusion(FusionModule):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, bev_maps: torch.Tensor) -> torch.Tensor:
+        # [B, V, C, H, W] -> [B, V*C, H, W]
+        B, V, C, H, W = bev_maps.shape
+        return bev_maps.reshape(B, V * C, H, W)
