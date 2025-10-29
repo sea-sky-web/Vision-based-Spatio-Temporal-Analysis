@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
+from torch.cuda.amp import autocast, GradScaler
+import torch.backends.cudnn as cudnn
 
 from data.wildtrack_loader import WildtrackDataset, collate_fn
 from models.model_wrapper import BEVNet
@@ -72,6 +74,14 @@ def main():
 
     cfg = load_cfg(args.config)
     device = torch.device(cfg['RUNTIME']['DEVICE'] if torch.cuda.is_available() else 'cpu')
+    # Enable cuDNN autotune and improved matmul precision when on CUDA
+    if device.type == 'cuda':
+        cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision('medium')
+        except Exception:
+            pass
+        print(f"[Runtime] Using CUDA: {torch.cuda.get_device_name(0)} | drivers CUDA {torch.version.cuda}")
 
     ds = WildtrackDataset(cfg)
     # Wildtrack精简规范：固定切分 train/val=400/100（若总帧不足则回退随机切分）
@@ -87,16 +97,39 @@ def main():
         n_train = total - n_val
         train_ds, val_ds = random_split(ds, [n_train, n_val])
 
-    dl_train = DataLoader(train_ds, batch_size=cfg['DATA']['BATCH_SIZE'], shuffle=True,
-                          num_workers=cfg['RUNTIME']['NUM_WORKERS'], collate_fn=collate_fn)
-    dl_val = DataLoader(val_ds, batch_size=cfg['DATA']['BATCH_SIZE'], shuffle=False,
-                        num_workers=cfg['RUNTIME']['NUM_WORKERS'], collate_fn=collate_fn)
+    # DataLoader tweaks for GPU: pin_memory + persistent_workers when num_workers>0
+    nw = int(cfg['RUNTIME']['NUM_WORKERS'])
+    pin_mem = device.type == 'cuda'
+    dl_train = DataLoader(
+        train_ds,
+        batch_size=cfg['DATA']['BATCH_SIZE'],
+        shuffle=True,
+        num_workers=nw,
+        collate_fn=collate_fn,
+        pin_memory=pin_mem,
+        persistent_workers=(nw > 0),
+        prefetch_factor=2 if nw > 0 else None,
+    )
+    dl_val = DataLoader(
+        val_ds,
+        batch_size=cfg['DATA']['BATCH_SIZE'],
+        shuffle=False,
+        num_workers=nw,
+        collate_fn=collate_fn,
+        pin_memory=pin_mem,
+        persistent_workers=(nw > 0),
+        prefetch_factor=2 if nw > 0 else None,
+    )
 
     model = BEVNet(cfg)
     model = model.to(device)
 
     optimizer = build_optimizer(model, cfg)
     scheduler = build_scheduler(optimizer, cfg)
+
+    # Mixed precision (AMP) for faster training on GPU
+    use_amp = bool(cfg.get('RUNTIME', {}).get('USE_AMP', True)) and device.type == 'cuda'
+    scaler = GradScaler(enabled=use_amp)
 
     best_f1 = -1.0
     save_dir = os.path.join(os.path.dirname(args.config), '..', cfg['RUNTIME']['SAVE_DIR']).replace('\\', '/')
@@ -136,7 +169,7 @@ def main():
         running_loss = 0.0
         first_batch_logged = False
         for batch in dl_train:
-            batch['images'] = batch['images'].to(device)
+            batch['images'] = batch['images'].to(device, non_blocking=True)
             # move calib tensors to device
             for b in range(len(batch['calib']['intrinsic'])):
                 batch['calib']['intrinsic'][b] = [k.to(device) for k in batch['calib']['intrinsic'][b]]
@@ -145,12 +178,21 @@ def main():
                 print(f"[Train][Epoch {epoch}] { _summarize_batch_gt(batch['targets']) }")
                 print(f"[Train][Epoch {epoch}] { _summarize_calib(batch['calib']) }")
                 first_batch_logged = True
-            preds = model(batch)
-            loss_dict = model.loss(preds, batch['targets'], cfg['LOSS'])
-            loss = loss_dict['total_loss']
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            if use_amp:
+                with autocast(dtype=torch.float16):
+                    preds = model(batch)
+                    loss_dict = model.loss(preds, batch['targets'], cfg['LOSS'])
+                    loss = loss_dict['total_loss']
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                preds = model(batch)
+                loss_dict = model.loss(preds, batch['targets'], cfg['LOSS'])
+                loss = loss_dict['total_loss']
+                loss.backward()
+                optimizer.step()
             running_loss += loss.item()
         scheduler.step()
 
@@ -160,7 +202,7 @@ def main():
             precisions, recalls, f1s, mles = [], [], [], []
             first_val_logged = False
             for batch in dl_val:
-                batch['images'] = batch['images'].to(device)
+                batch['images'] = batch['images'].to(device, non_blocking=True)
                 for b in range(len(batch['calib']['intrinsic'])):
                     batch['calib']['intrinsic'][b] = [k.to(device) for k in batch['calib']['intrinsic'][b]]
                     batch['calib']['extrinsic'][b] = [e.to(device) for e in batch['calib']['extrinsic'][b]]
@@ -168,7 +210,11 @@ def main():
                     print(f"[Val][Epoch {epoch}] { _summarize_batch_gt(batch['targets']) }")
                     print(f"[Val][Epoch {epoch}] { _summarize_calib(batch['calib']) }")
                     first_val_logged = True
-                preds = model(batch)
+                if use_amp:
+                    with autocast(dtype=torch.float16):
+                        preds = model(batch)
+                else:
+                    preds = model(batch)
                 # 评估使用thr=0.4, NMS=0.5m已在forward/decode中处理
                 p, r, f1, mle = compute_metrics(preds['boxes'], batch['targets'], match_dist=cfg['EVAL']['NMS_DIST_M'])
                 precisions.append(p); recalls.append(r); f1s.append(f1); mles.append(mle)

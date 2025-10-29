@@ -27,6 +27,7 @@ RUNTIME:
   NUM_WORKERS: 4
   SAVE_DIR: "checkpoints/"
   OUTPUT_DIR: "data/outputs/"
+  USE_AMP: true
 
 EVAL:
   CONF_THRESH: 0.4
