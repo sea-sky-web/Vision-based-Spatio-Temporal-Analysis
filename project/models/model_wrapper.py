@@ -129,38 +129,65 @@ class BEVNet(nn.Module):
 
         x_min, x_max, y_min, y_max = self.bounds
 
+        default_wh = torch.tensor(self.default_box_wh, device=device, dtype=torch.float32)
+
         for b, tgt in enumerate(targets):
             boxes = tgt.get('boxes_world', None)
             if boxes is None or boxes.numel() == 0:
                 centers = tgt.get('centers_world', None)
                 if centers is not None and centers.numel() > 0:
-                    default_wh = torch.tensor(self.default_box_wh, device=centers.device, dtype=torch.float32)
-                    boxes = torch.cat([centers, default_wh.repeat(centers.shape[0], 1)], dim=1)
+                    boxes = torch.cat([centers, default_wh.to(centers.device).repeat(centers.shape[0], 1)], dim=1)
             if boxes is None or boxes.numel() == 0:
                 continue
             boxes = boxes.to(device)
-            count = 0
-            for i in range(boxes.shape[0]):
-                if count >= self.max_objects:
-                    break
-                cx_m, cy_m, w_m, h_m = boxes[i]
-                x_rel = (cx_m.item() - x_min) / self.res_x
-                y_rel = (cy_m.item() - y_min) / self.res_y
-                if x_rel < 0 or x_rel >= self.bev_w or y_rel < 0 or y_rel >= self.bev_h:
-                    continue
-                gx = int(x_rel)
-                gy = int(y_rel)
-                radius = self._gaussian_radius(w_m.item() / self.res_x, h_m.item() / self.res_y)
-                hm[b, 0] = self._draw_gaussian(hm[b, 0], (gx, gy), radius)
-                indices[b, count] = gy * self.bev_w + gx
-                mask[b, count] = 1.0
-                offset[b, count, 0] = x_rel - gx
-                offset[b, count, 1] = y_rel - gy
-                size_w_cells = max(w_m.item() / self.res_x, 1e-3)
-                size_h_cells = max(h_m.item() / self.res_y, 1e-3)
-                size_log[b, count, 0] = math.log(size_w_cells)
-                size_log[b, count, 1] = math.log(size_h_cells)
-                count += 1
+            centers = boxes[:, :2]
+            sizes = boxes[:, 2:]
+
+            rel = torch.stack([
+                (centers[:, 0] - x_min) / self.res_x,
+                (centers[:, 1] - y_min) / self.res_y,
+            ], dim=1)
+
+            valid = (
+                (rel[:, 0] >= 0)
+                & (rel[:, 0] < self.bev_w)
+                & (rel[:, 1] >= 0)
+                & (rel[:, 1] < self.bev_h)
+            )
+            if not torch.any(valid):
+                continue
+
+            keep = torch.nonzero(valid, as_tuple=False).squeeze(1)
+            if keep.numel() > self.max_objects:
+                keep = keep[: self.max_objects]
+
+            rel = rel[keep]
+            sizes = sizes[keep]
+
+            gx_floor = torch.floor(rel[:, 0])
+            gy_floor = torch.floor(rel[:, 1])
+            offsets = torch.stack([rel[:, 0] - gx_floor, rel[:, 1] - gy_floor], dim=1)
+
+            size_cells_w = (sizes[:, 0] / self.res_x).clamp(min=1e-3)
+            size_cells_h = (sizes[:, 1] / self.res_y).clamp(min=1e-3)
+            size_logs = torch.stack([size_cells_w.log(), size_cells_h.log()], dim=1)
+
+            radii = self._gaussian_radius_tensor(size_cells_w, size_cells_h)
+
+            gx_long = gx_floor.to(torch.long)
+            gy_long = gy_floor.to(torch.long)
+            num_valid = rel.shape[0]
+
+            indices[b, :num_valid] = gy_long * self.bev_w + gx_long
+            mask[b, :num_valid] = 1.0
+            offset[b, :num_valid] = offsets
+            size_log[b, :num_valid] = size_logs
+
+            for obj_idx in range(num_valid):
+                gx_i = int(gx_long[obj_idx])
+                gy_i = int(gy_long[obj_idx])
+                radius_i = int(radii[obj_idx])
+                hm[b, 0] = self._draw_gaussian(hm[b, 0], (gx_i, gy_i), radius_i)
 
         return {
             'heatmap': hm,
@@ -169,6 +196,36 @@ class BEVNet(nn.Module):
             'offset': offset,
             'size_log': size_log,
         }
+
+    def _gaussian_radius_tensor(self, width_cells: torch.Tensor, height_cells: torch.Tensor) -> torch.Tensor:
+        width_cells = width_cells.clamp(min=1.0)
+        height_cells = height_cells.clamp(min=1.0)
+        min_overlap = self.gaussian_iou
+
+        a1 = torch.ones_like(width_cells)
+        b1 = height_cells + width_cells
+        c1 = width_cells * height_cells * (1 - min_overlap) / (1 + min_overlap)
+        sq1 = torch.clamp(b1 ** 2 - 4 * a1 * c1, min=0.0)
+        r1 = (b1 + torch.sqrt(sq1)) / 2
+
+        a2 = torch.full_like(width_cells, 4.0)
+        b2 = 2 * (height_cells + width_cells)
+        c2 = (1 - min_overlap) * width_cells * height_cells
+        sq2 = torch.clamp(b2 ** 2 - 4 * a2 * c2, min=0.0)
+        r2 = (b2 + torch.sqrt(sq2)) / (2 * a2)
+
+        if min_overlap == 0:
+            r3 = torch.full_like(width_cells, float('inf'))
+        else:
+            a3 = torch.full_like(width_cells, 4 * min_overlap)
+            b3 = -2 * min_overlap * (height_cells + width_cells)
+            c3 = (min_overlap - 1) * width_cells * height_cells
+            sq3 = torch.clamp(b3 ** 2 - 4 * a3 * c3, min=0.0)
+            r3 = (b3 + torch.sqrt(sq3)) / (2 * a3)
+
+        radius = torch.min(torch.min(r1, r2), r3)
+        radius = torch.clamp(radius, min=float(self.gaussian_min_radius))
+        return torch.floor(radius).to(torch.long)
 
     def _heatmap_focal_loss(self, pred_logits: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
         pred = torch.sigmoid(pred_logits)
