@@ -255,6 +255,9 @@ class WildtrackDataset(torch.utils.data.Dataset):
         C, H, W = cfg['DATA']['IMG_SIZE']
         self.img_size = (H, W)
         self.transform = build_transforms(img_size=(H, W))
+        loss_cfg = cfg.get('LOSS', {})
+        default_wh = loss_cfg.get('DEFAULT_BOX_WH', [0.6, 0.6])
+        self.default_box_wh = (float(default_wh[0]), float(default_wh[1]))
         self.frame_files: List[str] = []
         self.cam_dirs: List[Path] = []
         self.intrinsics: List[List[torch.Tensor]] = []
@@ -346,8 +349,14 @@ class WildtrackDataset(torch.utils.data.Dataset):
                     except Exception as e:
                         print(f"[WildtrackDataset] 解析标注失败: {json_path} ({e})")
             centers_t = torch.tensor(centers, dtype=torch.float32) if len(centers) > 0 else torch.zeros(0, 2)
+            if centers_t.numel() > 0:
+                w, h = self.default_box_wh
+                wh = torch.tensor([w, h], dtype=torch.float32)
+                boxes = torch.cat([centers_t, wh.repeat(centers_t.shape[0], 1)], dim=1)
+            else:
+                boxes = torch.zeros(0, 4, dtype=torch.float32)
             self.targets_per_frame.append({
-                'boxes_world': torch.zeros(0, 4),
+                'boxes_world': boxes,
                 'centers_world': centers_t,
                 'keypoints': None,
                 'calib': {'intrinsic': self.intrinsics[idx], 'extrinsic': self.extrinsics[idx]},

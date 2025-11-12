@@ -5,26 +5,61 @@ from typing import Dict, Tuple
 
 
 class BEVDetector(nn.Module):
-    def __init__(self, in_channels: int = 32, heatmap_sigma: float = 2.0, bev_bounds: Tuple[float, float, float, float] = (-6.0, 6.0, -2.0, 2.0)):
+    def __init__(
+        self,
+        in_channels: int = 32,
+        bev_bounds: Tuple[float, float, float, float] = (-6.0, 6.0, -2.0, 2.0),
+        bev_size: Tuple[int, int] = (64, 64),
+        default_box_wh: Tuple[float, float] = (0.6, 0.6),
+    ):
         super().__init__()
-        # 3层扩张卷积 + GroupNorm，较大感受野
         mid1, mid2 = 512, 128
-        self.head = nn.Sequential(
-            nn.Conv2d(in_channels, mid1, kernel_size=3, padding=1, dilation=1, bias=False),
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, mid1, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(num_groups=32, num_channels=mid1),
             nn.ReLU(inplace=True),
             nn.Conv2d(mid1, mid2, kernel_size=3, padding=2, dilation=2, bias=False),
             nn.GroupNorm(num_groups=32, num_channels=mid2),
             nn.ReLU(inplace=True),
-            nn.Conv2d(mid2, 1, kernel_size=3, padding=4, dilation=4)
+            nn.Conv2d(mid2, mid2, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(num_groups=32, num_channels=mid2),
+            nn.ReLU(inplace=True),
         )
-        self.heatmap_sigma = heatmap_sigma
+        self.heatmap_head = nn.Conv2d(mid2, 1, kernel_size=3, padding=1)
+        self.offset_head = nn.Conv2d(mid2, 2, kernel_size=3, padding=1)
+        self.size_head = nn.Conv2d(mid2, 2, kernel_size=3, padding=1)
+
+        # Init heads following CenterNet practice
+        nn.init.constant_(self.heatmap_head.bias, -2.19)
+        nn.init.constant_(self.offset_head.weight, 0.0)
+        nn.init.constant_(self.offset_head.bias, 0.0)
+
         self.bounds = bev_bounds
+        self.bev_h, self.bev_w = bev_size
+        self.res_x = (bev_bounds[1] - bev_bounds[0]) / float(self.bev_w)
+        self.res_y = (bev_bounds[3] - bev_bounds[2]) / float(self.bev_h)
+        default_w_cells = max(default_box_wh[0] / max(self.res_x, 1e-6), 1e-3)
+        default_h_cells = max(default_box_wh[1] / max(self.res_y, 1e-6), 1e-3)
+        size_bias = torch.log(torch.tensor([default_w_cells, default_h_cells], dtype=torch.float32))
+        with torch.no_grad():
+            self.size_head.bias.copy_(size_bias)
 
     def forward(self, bev_feat: torch.Tensor) -> Dict:
         # bev_feat: [B, C, H, W]
-        logits = self.head(bev_feat)  # [B,1,H,W]
-        return {"heatmap": logits.sigmoid()}
+        shared = self.stem(bev_feat)
+        heatmap_logits = self.heatmap_head(shared)
+        offset_raw = self.offset_head(shared)
+        size_raw = self.size_head(shared)
+        offset = torch.sigmoid(offset_raw)
+        size_cells = torch.exp(size_raw)
+        return {
+            "heatmap_logits": heatmap_logits,
+            "heatmap": torch.sigmoid(heatmap_logits),
+            "offset": offset,
+            "offset_raw": offset_raw,
+            "size": size_cells,
+            "size_raw": size_raw,
+        }
 
     @staticmethod
     def _nms2d(x: torch.Tensor, kernel: int = 3) -> torch.Tensor:
@@ -33,38 +68,43 @@ class BEVDetector(nn.Module):
         keep = (x == maxpool).float()
         return x * keep
 
-    def decode(self, heatmap: torch.Tensor, conf_thresh: float = 0.4, box_size_m: Tuple[float, float] = (0.6, 0.6), nms_dist_m: float = 0.5):
-        """Decode peaks to BEV box centers, returns boxes in meters.
-        heatmap: [B,1,H,W]
-        """
+    def decode(
+        self,
+        heatmap: torch.Tensor,
+        offset: torch.Tensor,
+        size_cells: torch.Tensor,
+        conf_thresh: float = 0.4,
+        nms_dist_m: float = 0.5,
+    ):
+        """Decode peaks with learned offsets and BEV footprint sizes."""
+
         B, _, H, W = heatmap.shape
         peaks = self._nms2d(heatmap)
-        xs_list, ys_list, scores_list = [], [], []
+        offset = offset.permute(0, 2, 3, 1)
+        size_cells = size_cells.permute(0, 2, 3, 1)
+
+        x_min, x_max, y_min, y_max = self.bounds
+        res_x = (x_max - x_min) / float(W)
+        res_y = (y_max - y_min) / float(H)
+
+        boxes_list, scores_out = [], []
         for b in range(B):
             hm = peaks[b, 0]
             mask = hm > conf_thresh
             ys, xs = torch.where(mask)
             scores = hm[mask]
-            xs_list.append(xs)
-            ys_list.append(ys)
-            scores_list.append(scores)
-        # convert pixel to meters
-        x_min, x_max, y_min, y_max = self.bounds
-        res_x = (x_max - x_min) / float(W)
-        res_y = (y_max - y_min) / float(H)
-        boxes_list, scores_out = [], []
-        for b in range(B):
-            xs = xs_list[b].float()
-            ys = ys_list[b].float()
-            scores = scores_list[b]
-            cx = x_min + (xs + 0.5) * res_x
-            cy = y_min + (ys + 0.5) * res_y
-            w_m, h_m = box_size_m
-            if cx.numel() == 0:
-                boxes = torch.zeros(0, 4)
-            else:
-                boxes = torch.stack([cx, cy, torch.full_like(cx, w_m), torch.full_like(cx, h_m)], dim=1)
-            # 简单BEV NMS：按中心距离>nms_dist_m保留最高分
+            if xs.numel() == 0:
+                boxes_list.append(torch.zeros(0, 4, device=heatmap.device))
+                scores_out.append(torch.zeros(0, device=heatmap.device))
+                continue
+            offsets = offset[b, ys, xs]
+            sizes = size_cells[b, ys, xs]
+            cx = x_min + (xs.float() + offsets[:, 0]) * res_x
+            cy = y_min + (ys.float() + offsets[:, 1]) * res_y
+            widths = sizes[:, 0] * res_x
+            heights = sizes[:, 1] * res_y
+            boxes = torch.stack([cx, cy, widths, heights], dim=1)
+
             if boxes.shape[0] > 1:
                 order = torch.argsort(scores, descending=True)
                 keep = []
@@ -72,8 +112,8 @@ class BEVDetector(nn.Module):
                 for idx in order:
                     c = centers[idx]
                     too_close = False
-                    for k in keep:
-                        if torch.norm(centers[k] - c).item() < nms_dist_m:
+                    for kept in keep:
+                        if torch.norm(centers[kept] - c).item() < nms_dist_m:
                             too_close = True
                             break
                     if not too_close:
