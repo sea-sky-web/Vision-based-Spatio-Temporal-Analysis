@@ -20,7 +20,19 @@ TRAIN:
   LR_SCHEDULER: "step"  # or "cosine"
 
 LOSS:
-  GT_SIGMA_PX: 1.0
+  # Default BEV footprint (meters) used when annotations缺少尺寸
+  DEFAULT_BOX_WH: [0.6, 0.6]
+  # Maximum number of instances considered per frame when构建训练目标
+  MAX_OBJECTS: 64
+  # CenterNet-style focal loss parameters
+  HM_ALPHA: 2.0
+  HM_BETA: 4.0
+  HM_WEIGHT: 1.0
+  OFFSET_WEIGHT: 1.0
+  SIZE_WEIGHT: 0.1
+  # Minimum Gaussian radius in BEV cells to guarantee可训练范围
+  GAUSSIAN_MIN_RADIUS: 2
+  GAUSSIAN_IOU: 0.7
 
 RUNTIME:
   DEVICE: "cuda"
