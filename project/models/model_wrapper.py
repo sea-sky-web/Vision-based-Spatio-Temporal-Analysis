@@ -20,6 +20,7 @@ class BEVNet(nn.Module):
         backbone = cfg['MODEL']['BACKBONE']
         use_pretrained = bool(cfg['MODEL'].get('PRETRAINED', False))
         out_index = int(cfg['MODEL'].get('OUT_INDEX', 2))
+        self.bev_proj_ch = int(cfg['MODEL'].get('BEV_PROJ_CH', 0))
         self.conf_thresh = float(cfg.get('EVAL', {}).get('CONF_THRESH', 0.4))
         self.nms_dist_m = float(cfg.get('EVAL', {}).get('NMS_DIST_M', 0.5))
         loss_cfg = cfg.get('LOSS', {})
@@ -43,6 +44,7 @@ class BEVNet(nn.Module):
         # detector in_channels = V*C + 2 (pos enc)
         # Note: actual V known at runtime; we build head lazily on first forward
         self.detector = None
+        self.proj = None
         self.bev_h, self.bev_w = bev_h, bev_w
         self.bounds = bev_bounds
         # Precompute BEV position encoding (sin/cos over normalized XY)
@@ -64,10 +66,13 @@ class BEVNet(nn.Module):
         else:
             Rt = extrinsics
         bev_per_view = self.geom(feats, K, Rt, img_size=(H, W))  # [B,V,C,H_bev,W_bev]
-        bev_concat = self.fusion(bev_per_view)  # [B,V*C,H_bev,W_bev]
-        # concat position encoding
-        pos = self.pos_enc.unsqueeze(0).expand(B, -1, -1, -1)  # [B,2,H,W]
-        bev_feat = torch.cat([bev_concat, pos], dim=1)
+        bev_concat = self.fusion(bev_per_view)
+        if self.proj is None and self.bev_proj_ch > 0:
+            in_ch = bev_concat.shape[1]
+            self.proj = nn.Conv2d(in_ch, self.bev_proj_ch, kernel_size=1).to(bev_concat.device)
+        bev_main = self.proj(bev_concat) if self.proj is not None else bev_concat
+        pos = self.pos_enc.unsqueeze(0).expand(B, -1, -1, -1)
+        bev_feat = torch.cat([bev_main, pos], dim=1)
         # lazy build detector to match in_channels
         if self.detector is None:
             in_ch = bev_feat.shape[1]

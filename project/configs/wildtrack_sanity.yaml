@@ -1,0 +1,42 @@
+DATA:
+  BATCH_SIZE: 1
+  IMG_SIZE: [3, 270, 480]
+  VIEWS: 7
+  DATA_ROOT: "project/data/Wildtrack"
+
+MODEL:
+  BACKBONE: "resnet18"
+  PRETRAINED: false
+  FEAT_DIM: 64
+  OUT_INDEX: 2
+  BEV_SIZE: [32, 80, 240]
+  BEV_BOUNDS: [-24.0, 24.0, -7.2, 7.2]
+  BEV_PROJ_CH: 64
+
+TRAIN:
+  EPOCHS: 1
+  LR: 1e-3
+  OPT: "Adam"
+  WEIGHT_DECAY: 1e-4
+  LR_SCHEDULER: "cosine_warm"
+  WARMUP_EPOCHS: 1
+  ACCUM_STEPS: 1
+
+LOSS:
+  GT_SIGMA_PX: 1.0
+
+RUNTIME:
+  DEVICE: "cuda"
+  NUM_WORKERS: 0
+  SAVE_DIR: "checkpoints/"
+  OUTPUT_DIR: "data/outputs/"
+  USE_AMP: false
+  DEBUG_MAX_STEPS: 30
+
+EVAL:
+  CONF_THRESH: 0.4
+  NMS_DIST_M: 0.5
+  INTERVAL: 1
+  BASELINE_MODEL: "resnet18-quick"
+  BASELINE_F1: 0.0
+  IMPROVEMENT_THRESHOLD: 5.0

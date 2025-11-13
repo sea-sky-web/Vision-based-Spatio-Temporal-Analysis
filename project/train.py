@@ -1,17 +1,40 @@
 import os
 import argparse
 import yaml
+import time
+from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from torch.cuda.amp import autocast, GradScaler
 import torch.backends.cudnn as cudnn
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    class SummaryWriter:
+        def __init__(self, *args, **kwargs):
+            pass
+        def add_scalar(self, *args, **kwargs):
+            pass
+        def close(self):
+            pass
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except Exception:
+    _HAS_PSUTIL = False
+try:
+    import pynvml
+    _HAS_NVML = True
+except Exception:
+    _HAS_NVML = False
 
 from data.wildtrack_loader import WildtrackDataset, collate_fn
 from models.model_wrapper import BEVNet
 from utils.visualization import save_bev_heatmap
 from typing import List, Dict
+import matplotlib.pyplot as plt
 
 
 def load_cfg(path: str):
@@ -33,8 +56,23 @@ def build_scheduler(optimizer, cfg):
     name = cfg['TRAIN']['LR_SCHEDULER']
     if name == 'step':
         return optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
-    else:
-        return optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg['TRAIN']['EPOCHS'])
+    if name == 'cosine_warm':
+        warm = int(cfg['TRAIN'].get('WARMUP_EPOCHS', 3))
+        total = int(cfg['TRAIN']['EPOCHS'])
+        def lr_lambda(epoch):
+            if epoch < warm:
+                return float(epoch + 1) / float(max(1, warm))
+            return 1.0
+        base = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+        cos = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, total - warm))
+        class _Seq:
+            def __init__(self, scheds):
+                self.scheds = scheds
+            def step(self):
+                for s in self.scheds:
+                    s.step()
+        return _Seq([base, cos])
+    return optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg['TRAIN']['EPOCHS'])
 
 
 def compute_metrics(pred_boxes, gt_targets, match_dist=0.5):
@@ -63,7 +101,7 @@ def compute_metrics(pred_boxes, gt_targets, match_dist=0.5):
     recall = tp / max(1, tp + fn)
     f1 = 2 * precision * recall / max(1e-6, precision + recall)
     mle = float(sum(loc_errors) / max(1, len(loc_errors)))
-    return precision, recall, f1, mle
+    return precision, recall, f1, mle, tp, fp, fn
 
 
 def main():
@@ -129,11 +167,21 @@ def main():
 
     # Mixed precision (AMP) for faster training on GPU
     use_amp = bool(cfg.get('RUNTIME', {}).get('USE_AMP', True)) and device.type == 'cuda'
-    scaler = GradScaler(enabled=use_amp)
+    try:
+        scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    except Exception:
+        scaler = GradScaler(enabled=use_amp)
 
     best_f1 = -1.0
     save_dir = os.path.join(os.path.dirname(args.config), '..', cfg['RUNTIME']['SAVE_DIR']).replace('\\', '/')
     os.makedirs(save_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=os.path.join(save_dir, 'tb'))
+    interval = int(cfg.get('EVAL', {}).get('INTERVAL', 1))
+    mem_limit = int(cfg.get('RUNTIME', {}).get('MEMORY_LIMIT_PERCENT', 90))
+    baseline_name = str(cfg.get('EVAL', {}).get('BASELINE_MODEL', 'baseline'))
+    baseline_f1 = float(cfg.get('EVAL', {}).get('BASELINE_F1', 0.0))
+    improve_thr = float(cfg.get('EVAL', {}).get('IMPROVEMENT_THRESHOLD', 5.0))
+    early_patience = int(cfg.get('TRAIN', {}).get('PATIENCE', 0))
 
     def _summarize_batch_gt(targets: List[Dict]) -> str:
         counts = []
@@ -164,10 +212,19 @@ def main():
             tnorms.append(round(tnorm, 3))
         return f"Rt angles(rad): {angles} | t_norms: {tnorms}"
 
+    accum_steps = int(cfg['TRAIN'].get('ACCUM_STEPS', 1))
+    debug_max = int(cfg.get('RUNTIME', {}).get('DEBUG_MAX_STEPS', 0))
+    global_step = 0
+    no_improve_epochs = 0
+    train_loss_curve = []
+    val_f1_curve = []
     for epoch in range(cfg['TRAIN']['EPOCHS']):
         model.train()
         running_loss = 0.0
         first_batch_logged = False
+        step_count = 0
+        optimizer.zero_grad(set_to_none=True)
+        t0 = time.perf_counter()
         for batch in dl_train:
             batch['images'] = batch['images'].to(device, non_blocking=True)
             # move calib tensors to device
@@ -178,30 +235,45 @@ def main():
                 print(f"[Train][Epoch {epoch}] { _summarize_batch_gt(batch['targets']) }")
                 print(f"[Train][Epoch {epoch}] { _summarize_calib(batch['calib']) }")
                 first_batch_logged = True
-            optimizer.zero_grad(set_to_none=True)
             if use_amp:
                 with autocast(dtype=torch.float16):
                     preds = model(batch)
                     loss_dict = model.loss(preds, batch['targets'], cfg['LOSS'])
-                    loss = loss_dict['total_loss']
+                    loss = loss_dict['total_loss'] / float(max(1, accum_steps))
                 scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                if (step_count + 1) % accum_steps == 0:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
             else:
                 preds = model(batch)
                 loss_dict = model.loss(preds, batch['targets'], cfg['LOSS'])
-                loss = loss_dict['total_loss']
+                loss = loss_dict['total_loss'] / float(max(1, accum_steps))
                 loss.backward()
-                optimizer.step()
+                if (step_count + 1) % accum_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
             running_loss += loss.item()
+            step_count += 1
+            global_step += 1
+            if step_count % 10 == 0:
+                dt = time.perf_counter() - t0
+                spp = step_count / max(1e-6, dt)
+                print(f"[Train][Epoch {epoch}] steps={step_count} avg_steps/s={spp:.2f}")
+            writer.add_scalar('train/loss_iter', float(loss.item()), global_step)
+            if debug_max > 0 and step_count >= debug_max:
+                break
         scheduler.step()
 
         # validation
         model.eval()
+        do_eval = ((epoch + 1) % max(1, interval) == 0)
         with torch.no_grad():
             precisions, recalls, f1s, mles = [], [], [], []
+            tps, fps, fns = 0, 0, 0
             first_val_logged = False
-            for batch in dl_val:
+            val_step_count = 0
+            for batch in dl_val if do_eval else []:
                 batch['images'] = batch['images'].to(device, non_blocking=True)
                 for b in range(len(batch['calib']['intrinsic'])):
                     batch['calib']['intrinsic'][b] = [k.to(device) for k in batch['calib']['intrinsic'][b]]
@@ -216,15 +288,50 @@ def main():
                 else:
                     preds = model(batch)
                 # 评估使用thr=0.4, NMS=0.5m已在forward/decode中处理
-                p, r, f1, mle = compute_metrics(preds['boxes'], batch['targets'], match_dist=cfg['EVAL']['NMS_DIST_M'])
+                p, r, f1, mle, tp, fp, fn = compute_metrics(preds['boxes'], batch['targets'], match_dist=cfg['EVAL']['NMS_DIST_M'])
                 precisions.append(p); recalls.append(r); f1s.append(f1); mles.append(mle)
+                tps += tp; fps += fp; fns += fn
                 if args.save_vis:
                     save_bev_heatmap(preds['heatmap'], os.path.join(cfg['RUNTIME']['OUTPUT_DIR'], f'epoch{epoch}_hm.png'))
+                val_step_count += 1
+                if debug_max > 0 and val_step_count >= debug_max:
+                    break
             mean_p = sum(precisions)/max(1,len(precisions))
             mean_r = sum(recalls)/max(1,len(recalls))
             mean_f1 = sum(f1s)/max(1,len(f1s))
             mean_mle = sum(mles)/max(1,len(mles))
-            print(f"Epoch {epoch}: P={mean_p:.3f} R={mean_r:.3f} F1={mean_f1:.3f} MLE={mean_mle:.3f} train_loss={running_loss/len(dl_train):.4f}")
+            train_loss_epoch = running_loss/len(dl_train)
+            train_loss_curve.append(float(train_loss_epoch))
+            if do_eval:
+                val_f1_curve.append(float(mean_f1))
+            stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            phase = 'eval' if do_eval else 'train'
+            print(f"[{stamp}] phase={phase} epoch={epoch} loss={train_loss_epoch:.4f} P={mean_p:.3f} R={mean_r:.3f} F1={mean_f1:.3f} MLE={mean_mle:.3f} TP={tps} FP={fps} FN={fns}")
+            if _HAS_NVML:
+                try:
+                    pynvml.nvmlInit()
+                    h = pynvml.nvmlDeviceGetHandleByIndex(0)
+                    util = pynvml.nvmlDeviceGetUtilizationRates(h)
+                    mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+                    mem_percent = int(mem.used * 100 / max(1, mem.total))
+                    print(f"[GPU] util={util.gpu}% mem_used={mem.used/1024/1024:.1f}MB mem%={mem_percent}%")
+                    if mem_percent >= mem_limit:
+                        trig = os.path.join(save_dir, 'mem_triggered.pth')
+                        torch.save({'epoch': epoch, 'state_dict': model.state_dict(), 'f1': mean_f1}, trig)
+                        print(f"Saved memory-triggered checkpoint: {trig}")
+                except Exception:
+                    pass
+            if _HAS_PSUTIL:
+                try:
+                    cpu = psutil.cpu_percent(interval=None)
+                    ram = psutil.virtual_memory().percent
+                    print(f"[SYS] cpu={cpu}% ram={ram}%")
+                except Exception:
+                    pass
+            writer.add_scalar('val/precision', float(mean_p), epoch)
+            writer.add_scalar('val/recall', float(mean_r), epoch)
+            writer.add_scalar('val/f1', float(mean_f1), epoch)
+            writer.add_scalar('val/mle', float(mean_mle), epoch)
 
             # checkpoint
             last_path = os.path.join(save_dir, 'last.pth')
@@ -234,7 +341,27 @@ def main():
                 best_path = os.path.join(save_dir, 'best.pth')
                 torch.save({'epoch': epoch, 'state_dict': model.state_dict(), 'f1': mean_f1}, best_path)
                 print(f"Saved new best checkpoint: {best_path}")
+                no_improve_epochs = 0
+            else:
+                no_improve_epochs += 1
+            if early_patience > 0 and no_improve_epochs >= early_patience and do_eval:
+                print(f"Early stopping at epoch {epoch} due to no improvement")
+                break
 
-
+    try:
+        plt.figure(figsize=(6,4))
+        plt.plot(train_loss_curve, label='train_loss')
+        if len(val_f1_curve) > 0:
+            plt.plot(val_f1_curve, label='val_f1')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'learning_curves.png'))
+        plt.close()
+    except Exception:
+        pass
+    try:
+        writer.close()
+    except Exception:
+        pass
 if __name__ == '__main__':
     main()
