@@ -17,6 +17,7 @@
 * **天生免除Re-ID**: 通过在检测前融合多视角特征，从架构上消除了在2D图像空间进行跨镜头目标匹配的需要。
 * **抗遮挡性**: 融合后的BEV特征可以综合利用不同视角的信息，一个视角中的遮挡可以被其他视角的信息所弥补。
 * **现代化与模块化**: 基于最新的、稳定的深度学习库构建，代码结构清晰，易于迭代和扩展。
+* **推理插件体系**: 通过 `RUNTIME.PLUGINS` 即插即用地挂载诸如轨迹导出等推理阶段模块，保持主干网络与算法化后处理的解耦。
 * **鲁棒轨迹输出**: 内置基于 Kalman Filter + 多阶段关联（ByteTrack 风格）的 BEV 轨迹模块，可在强遮挡/短暂消失后保持轨迹连续并自动重连。
 
 ## 技术架构 (Technical Architecture)
@@ -73,14 +74,14 @@
 
 ### 模块二：轨迹输出（当前实现）
 
-* **核心组件**: `SimpleTrajectoryTracker`（`project/models/tracking/simple_tracker.py`），采用 Kalman Filter 的常速运动模型，并结合 ByteTrack 式双阶段关联（高置信与低置信分开匹配）以避免轨迹断裂。
-* **无需额外训练**: 该轨迹模块只依赖推理阶段由模块一输出的 BEV 检测框和置信度，通过纯算法的在线状态估计完成轨迹关联；无需对 tracker 本身进行数据集训练，也没有任何可学习权重，调参只需修改 `TRACKER.*` 配置即可。
+* **核心组件**: `SimpleTrajectoryTracker`（`project/models/tracking/simple_tracker.py`），采用 Kalman Filter 的常速运动模型，并结合 ByteTrack 式双阶段关联（高置信与低置信分开匹配）以避免轨迹断裂。它通过 `TrackingPlugin` (`project/plugins/tracking_plugin.py`) 作为推理插件无缝衔接到模块一的输出流中。
+* **无需额外训练**: 该轨迹模块只依赖推理阶段由模块一输出的 BEV 检测框和置信度，通过纯算法的在线状态估计完成轨迹关联；无需对 tracker 本身进行数据集训练，也没有任何可学习权重，调参只需修改 `TRACKER.*` 配置即可。借助插件生命周期，轨迹逻辑与主干推理完全解耦。
 * **工作流程**:
     1.  推理阶段按帧读取 BEV 检测框+置信度，先用卡尔曼预测器外推所有已存在轨迹。
     2.  使用马氏距离 / 匈牙利匹配关联高置信检测，未匹配轨迹进入“丢失”状态并放入 ReID 缓冲区。
     3.  将剩余轨迹与低置信检测再次匹配，可在遮挡结束后快速重连；超出 `REID_MAX_AGE` 的轨迹才会真正结束。
     4.  将所有满足 `MIN_HITS` 的轨迹写入 `data/outputs/trajectories.json`，包含完整历史，方便下游可视化或行为分析。
-* **融合策略**: 该模块直接消费模块一输出的 BEV 检测结果，无需引入额外的 2D Re-ID；并且由于轨迹状态在 BEV 空间连续，可在未来通过联合损失对检测与跟踪进行协同优化。
+* **融合策略**: 该模块直接消费模块一输出的 BEV 检测结果，依托插件钩子在推理循环内逐帧接收检测并维护轨迹，无需引入额外的 2D Re-ID；并且由于轨迹状态在 BEV 空间连续，可在未来通过联合损失对检测与跟踪进行协同优化。
 
 ## 数据集 (Dataset)
 
@@ -125,7 +126,7 @@ python train.py --config configs/wildtrack_v1_resnet50.yaml
 python inference.py --config configs/wildtrack_v1_resnet50.yaml --input_path /path/to/your/image_folders --output_path /path/to/save/bev_map
 ```
 
-推理脚本会在 `RUNTIME.OUTPUT_DIR` 下生成逐帧检测 JSON，同时（默认启用）将 `SimpleTrajectoryTracker` 输出的轨迹写入 `trajectories.json`。如需禁用轨迹导出，可在配置中设置 `TRACKER.ENABLED: false`。
+推理脚本会在 `RUNTIME.OUTPUT_DIR` 下生成逐帧检测 JSON，同时根据 `RUNTIME.PLUGINS` 中声明的插件自动执行后处理。例如默认启用的 `tracking` 插件会实例化 `SimpleTrajectoryTracker` 并写入 `trajectories.json`。如需禁用轨迹导出，可将 `TRACKER.ENABLED: false` 或直接从 `RUNTIME.PLUGINS` 中移除 `tracking`。
 
 ## 未来工作 (Future Work)
 

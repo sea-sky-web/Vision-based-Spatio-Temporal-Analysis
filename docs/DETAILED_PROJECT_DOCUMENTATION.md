@@ -85,28 +85,53 @@
 
 ## `project/inference.py`
 ### 模块概览
-推理脚本入口，负责加载训练后的模型并对整套 Wildtrack 数据执行前向推理与结果导出。
-
-> **提示**：代码中使用了 `argparse`、`yaml`，需确保运行脚本前已导入（当前文件缺少显式 `import argparse, yaml`，使用时应补全）。
+推理脚本入口，负责加载训练后的模型，对整套 Wildtrack 数据执行前向推理，并驱动 `project/plugins` 下声明的推理插件以实现解耦的后处理（如轨迹导出）。
 
 ### `load_cfg(path: str) -> dict`
 - 与训练脚本的同名函数类似，但未指定编码（使用系统默认）。
 - 返回值为配置字典。
 
 ### `main()`
-- **职责**：批量推理与保存预测。
+- **职责**：批量推理、保存检测结果，并在生命周期内调度插件。
 - **步骤**：
   1. 解析命令行参数：`--config`（必需）和 `--checkpoint`（默认 `checkpoints/best.pth`）。
   2. 读取配置，选择设备（优先配置指定 GPU，若无 CUDA 则回退 CPU）。
   3. 构造完整的 `WildtrackDataset` 与不打乱的 `DataLoader`；batch 大小取自 `DATA.BATCH_SIZE`。
   4. 初始化 `BEVNet`，加载权重：`torch.load(..., map_location=device)`，`strict=False` 允许缺失/额外键。
   5. 将模型移动到设备并设置为评估模式。
-  6. 推理循环：
+  6. 根据 `RUNTIME.PLUGINS`（若缺省则回退到 `TRACKER` 配置）调用 `build_plugins`，并为每个插件触发 `on_start(context)`，`context` 含 `output_dir`、`device` 等共享信息。
+  7. 推理循环：
      - 将 batch 图像及标定张量移至设备。
      - 在 `torch.no_grad()` 环境调用 `model(batch)`。
+     - 逐个插件调用 `on_batch(predictions, batch, context)`，以便诸如轨迹跟踪等算法即时消费检测结果。
      - 收集 `batch['meta']` 内的 `frame_idx`，调用 `save_predictions_json` 输出到 `RUNTIME.OUTPUT_DIR`。
-  7. 循环结束后打印保存目录。
-- **副作用**：创建/写入 JSON 文件，每个 batch 的每一帧对应一个 `frame_XXXXXX.json`。
+  8. 循环结束后，为所有插件调用 `on_finish(context)`，常用于写出轨迹/统计文件。
+- **副作用**：
+  - 创建/写入逐帧检测 JSON（`frame_XXXXXX.json`）。
+  - 插件可追加额外副作用，如 `TrackingPlugin` 生成 `trajectories.json`。
+
+### `project/plugins/__init__.py`
+- **模块概览**：提供推理插件的构建工厂，并导出 `InferencePlugin` 基类。
+- **`build_plugins(cfg, device, output_dir)`**：
+  - 读取 `RUNTIME.PLUGINS`，若缺省则在存在 `TRACKER` 配置时自动注册 `['tracking']`，确保向下兼容。
+  - 根据名称创建插件实例，目前支持 `tracking` → `TrackingPlugin`。
+  - 若配置未知插件会抛出 `ValueError`。
+
+### `project/plugins/base.py`
+- **模块概览**：定义推理插件生命周期接口。
+- **`class InferencePlugin`**：
+  - `on_start(context)`：推理开始前回调。
+  - `on_batch(predictions, batch, context)`：每个 batch 结束后回调，可访问检测结果与原 batch 元数据。
+  - `on_finish(context)`：推理全部完成后回调，用于释放资源或写出文件。
+
+### `project/plugins/tracking_plugin.py`
+- **模块概览**：封装 `SimpleTrajectoryTracker` 的推理插件实现，负责将 BEV 检测流转换为轨迹 JSON。
+- **构造函数**：接受 `cfg`, `device`, `output_dir`；提前计算输出路径 `trajectories.json` 并解析各种阈值。
+- **`on_start`**：若 `TRACKER.ENABLED` 为真，实例化 `SimpleTrajectoryTracker` 并打印提示，强调该插件纯算法化、推理即用。
+- **`on_batch`**：
+  - 从 `batch['meta']` 读取 `frame_idx`。
+  - 将 `predictions['boxes']` / `predictions['scores']` 逐帧送入 tracker，内部自动完成马氏距离匹配与 ReID 缓冲。
+- **`on_finish`**：收集全部轨迹（包含活跃轨迹），调用 `save_trajectories_json` 写入磁盘，并打印保存路径。
 
 ---
 

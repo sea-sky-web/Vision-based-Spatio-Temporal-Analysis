@@ -45,6 +45,8 @@ RUNTIME:
   USE_AMP: true
   DEBUG_MAX_STEPS: 50
   MEMORY_LIMIT_PERCENT: 90
+  PLUGINS:
+    - tracking  # 推理阶段启用轨迹插件，可根据需要添加/移除
 
 TRACKER:
   ENABLED: true  # 纯算法模块，无需训练，只在推理阶段根据检测结果运行
