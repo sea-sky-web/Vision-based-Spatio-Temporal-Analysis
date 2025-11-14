@@ -51,6 +51,10 @@ def main():
             dist_threshold=float(tracker_cfg.get('DIST_THRESH', 1.5)),
             device=device,
         )
+        print(
+            "[Tracker] SimpleTrajectoryTracker 已启用：其所有参数均来自配置，"
+            "无需任何额外训练，将直接在推理阶段消费 BEV 检测结果。"
+        )
 
     out_dir = cfg['RUNTIME']['OUTPUT_DIR']
     frame_indices = []

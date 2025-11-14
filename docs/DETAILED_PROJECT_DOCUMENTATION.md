@@ -395,7 +395,7 @@ Wildtrack 数据集读取与标定解析。包含大量 XML 解析与几何投�
 
 ## `project/models/tracking/simple_tracker.py`
 ### 模块概览
-提供基于卡尔曼滤波的 BEV 在线跟踪器，结合 ByteTrack 风格的双阶段关联与 ReID 缓冲，显著降低遮挡造成的轨迹断裂。
+提供基于卡尔曼滤波的 BEV 在线跟踪器，结合 ByteTrack 风格的双阶段关联与 ReID 缓冲，显著降低遮挡造成的轨迹断裂。**该模块完全训练无关**：所有参数都来自配置文件，内部没有可学习权重，也不会参与反向传播；只要检测头可输出 BEV 框，就能即插即用地生成轨迹。
 
 - `class SimpleTrajectoryTracker`
   - **初始化参数**：

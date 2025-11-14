@@ -34,7 +34,7 @@ RUNTIME:
   DEBUG_MAX_STEPS: 30
 
 TRACKER:
-  ENABLED: true
+  ENABLED: true  # 纯算法模块，无需训练，只在推理阶段根据检测结果运行
   MAX_AGE: 12
   MIN_HITS: 2
   SIZE_ALPHA: 0.25
