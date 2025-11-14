@@ -390,6 +390,42 @@ Wildtrack 数据集读取与标定解析。包含大量 XML 解析与几何投�
 ## `project/models/heads/__init__.py`
 - 注释 `# heads package`。
 
+## `project/models/tracking/__init__.py`
+- 暴露 `SimpleTrajectoryTracker` 类，使推理脚本可通过 `from models.tracking import SimpleTrajectoryTracker` 导入。
+
+## `project/models/tracking/simple_tracker.py`
+### 模块概览
+提供基于卡尔曼滤波的 BEV 在线跟踪器，结合 ByteTrack 风格的双阶段关联与 ReID 缓冲，显著降低遮挡造成的轨迹断裂。
+
+- `class SimpleTrajectoryTracker`
+  - **初始化参数**：
+    - `max_age`：轨迹未观测 `max_age` 帧后被标记为 `LOST`。
+    - `reid_max_age`：ReID 缓冲区长度；只有未观测帧数超过该值才会真正结束轨迹。
+    - `min_hits`：轨迹须至少匹配 `min_hits` 次才会对外输出。
+    - `size_alpha`：宽高的 EMA 平滑系数。
+    - `high_conf_thresh` / `low_conf_thresh`：划分高、低置信检测的阈值，用于 ByteTrack 式双阶段匹配。
+    - `gating_threshold`：马氏距离的门限；当依赖欧氏距离时则使用 `dist_threshold`。
+    - `process_var` / `measurement_var`：卡尔曼过程噪声与观测噪声。
+    - `use_mahalanobis`：切换马氏距离与欧氏距离。
+    - `device`：内部张量所在设备。
+    - 初始化时会构建 `KalmanFilter2D` 并 `reset()`。
+  - `reset()`：清空活动轨迹、历史轨迹以及 ID 计数器。
+  - `_new_track(frame_idx, box, score)`：创建包含 `mean/cov`、`size`、`history` 的新轨迹并注册到 `active_tracks`。
+  - `_predict_track(track, frame_idx)`：依据帧间隔执行卡尔曼预测，更新 `age` 与 `time_since_update`。
+  - `_associate(tracks, detections)`：
+    - 构造马氏/欧氏距离代价矩阵。
+    - 首选 `linear_sum_assignment` 求解匈牙利匹配，若 SciPy 不可用则回退贪心。
+    - 仅返回满足门限的匹配对，以及剩余未匹配轨迹/检测索引。
+  - `_update_track(track, frame_idx, det_box, det_score)`：执行卡尔曼更新、EMA 平滑宽高，记录最新观测并把状态设置为 `TRACKED`。
+  - `update(frame_idx, boxes, scores)`：
+    1. 迁移输入张量到 tracker 设备后，对所有轨迹进行预测。
+    2. 使用高置信检测与 `TRACKED` 轨迹做第一阶段关联。
+    3. 将余下轨迹（含 `LOST` 状态）与低置信检测再次匹配，实现遮挡后的快速重连。
+    4. 对长时间未更新的轨迹保持 `LOST` 状态直至超过 `reid_max_age`，届时序列化到 `finished_tracks`。
+    5. 返回当前帧所有满足 `min_hits` 的轨迹观测。
+  - `_serialize_track(track)`：把轨迹历史转换为 JSON 友好的格式，包含 `start/end_frame` 与 `history` 序列。
+  - `get_trajectories(include_active=True)`：返回已完成轨迹与仍处于缓冲区的轨迹（当 `include_active=True`）。
+
 ---
 
 ## `project/data/__init__.py`
@@ -416,6 +452,10 @@ Wildtrack 数据集读取与标定解析。包含大量 XML 解析与几何投�
     - 将 `Tensor` 转为 Python list（若为 `None` 则输出空列表）。
     - 写入 `frame_{frame_idx:06d}.json`，包含 `frame_idx`、`boxes`、`scores`。
   - 自动创建输出目录；会覆盖同名文件。
+- `save_trajectories_json(tracks, save_path)`
+  - 接收 `SimpleTrajectoryTracker` 返回的轨迹列表，逐条读取 `track_id`、`start/end_frame`、`history`。
+  - 逐个历史点写入 `frame_idx/cx/cy/w/h/score` 字段。
+  - 自动创建父目录并写入单个 JSON 文件。
 
 ---
 

@@ -17,6 +17,7 @@
 * **天生免除Re-ID**: 通过在检测前融合多视角特征，从架构上消除了在2D图像空间进行跨镜头目标匹配的需要。
 * **抗遮挡性**: 融合后的BEV特征可以综合利用不同视角的信息，一个视角中的遮挡可以被其他视角的信息所弥补。
 * **现代化与模块化**: 基于最新的、稳定的深度学习库构建，代码结构清晰，易于迭代和扩展。
+* **鲁棒轨迹输出**: 内置基于 Kalman Filter + 多阶段关联（ByteTrack 风格）的 BEV 轨迹模块，可在强遮挡/短暂消失后保持轨迹连续并自动重连。
 
 ## 技术架构 (Technical Architecture)
 
@@ -70,6 +71,16 @@
     2.  端到端优化整个模型，提升MODA/MODP等MCMT评价指标。
 * **成功标准**: 系统能够稳定输出带有时序和ID信息的行人轨迹。
 
+### 模块二：轨迹输出（当前实现）
+
+* **核心组件**: `SimpleTrajectoryTracker`（`project/models/tracking/simple_tracker.py`），采用 Kalman Filter 的常速运动模型，并结合 ByteTrack 式双阶段关联（高置信与低置信分开匹配）以避免轨迹断裂。
+* **工作流程**:
+    1.  推理阶段按帧读取 BEV 检测框+置信度，先用卡尔曼预测器外推所有已存在轨迹。
+    2.  使用马氏距离 / 匈牙利匹配关联高置信检测，未匹配轨迹进入“丢失”状态并放入 ReID 缓冲区。
+    3.  将剩余轨迹与低置信检测再次匹配，可在遮挡结束后快速重连；超出 `REID_MAX_AGE` 的轨迹才会真正结束。
+    4.  将所有满足 `MIN_HITS` 的轨迹写入 `data/outputs/trajectories.json`，包含完整历史，方便下游可视化或行为分析。
+* **融合策略**: 该模块直接消费模块一输出的 BEV 检测结果，无需引入额外的 2D Re-ID；并且由于轨迹状态在 BEV 空间连续，可在未来通过联合损失对检测与跟踪进行协同优化。
+
 ## 数据集 (Dataset)
 
 本项目主要面向**Wildtrack**及其同类数据集。这类数据集必须提供：
@@ -112,6 +123,8 @@ python train.py --config configs/wildtrack_v1_resnet50.yaml
 ```bash
 python inference.py --config configs/wildtrack_v1_resnet50.yaml --input_path /path/to/your/image_folders --output_path /path/to/save/bev_map
 ```
+
+推理脚本会在 `RUNTIME.OUTPUT_DIR` 下生成逐帧检测 JSON，同时（默认启用）将 `SimpleTrajectoryTracker` 输出的轨迹写入 `trajectories.json`。如需禁用轨迹导出，可在配置中设置 `TRACKER.ENABLED: false`。
 
 ## 未来工作 (Future Work)
 
