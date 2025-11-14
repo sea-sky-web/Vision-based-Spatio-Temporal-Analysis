@@ -34,7 +34,7 @@
     * 使用OpenCV对2D特征图进行逆透视变换，将其“拍扁”并投影到预定义的BEV世界坐标系下的虚拟“地面”上。
 
 4.  **BEV特征融合 (BEV Fusion)**:
-    * 将来自N个摄像头的BEV特征图进行融合，生成一张单一的、信息增强的BEV特征图。
+    * 将来自N个摄像头的BEV特征图进行融合，生成一张单一的、信息增强的BEV特征图。仓库提供了逐元素 `SimpleFusion`、沿通道拼接的 `ConcatFusion` 以及跨视角注意力池化的 `AttentionFusion`，可通过配置 `MODEL.FUSION.TYPE` 在三者之间切换。
 
 5.  **下游任务头 (Downstream Heads)**:
     * 在融合后的BEV特征图上，接入不同的任务头来完成特定任务：

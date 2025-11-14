@@ -36,7 +36,7 @@
    - 可引入 mixup/cutmix 的多视角变体以增强鲁棒性，注意保持几何关系。
 
 2. **多尺度特征**
-   - 若采用 `ConcatFusion`，随着视角数增加通道数迅速膨胀。考虑引入 1×1 conv 压缩或改为 attention fusion，参考 MVDet 的 transformer-style 融合策略。【F:project/models/model_wrapper.py†L35-L74】
+   - 若采用 `ConcatFusion`，随着视角数增加通道数迅速膨胀。现在已提供 `AttentionFusion`（跨视角多头注意力池化）可直接通过 `MODEL.FUSION.TYPE=attention` 启用，以控制通道尺寸并自适应分配视角权重；仍可结合 1×1 conv 做进一步压缩。【F:project/models/model_wrapper.py†L35-L75】
 
 3. **几何一致性正则**
    - 激活 `_geom_consistency_loss`，在 `loss` 中按权重加入，可缓解标定噪声造成的 BEV 偏移。【F:project/models/model_wrapper.py†L121-L151】
