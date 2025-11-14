@@ -6,7 +6,7 @@ from typing import Dict, Any, Tuple, List
 
 from .encoders.cnn_encoder import CNNEncoder
 from .fusion.geometry import GeometryTransformer
-from .fusion.fusion import SimpleFusion, ConcatFusion
+from .fusion.fusion import SimpleFusion, ConcatFusion, AttentionFusion
 from .heads.detector import BEVDetector
 
 
@@ -40,7 +40,17 @@ class BEVNet(nn.Module):
         # modules
         self.encoder = CNNEncoder(out_channels=feat_dim, backbone=backbone, pretrained=use_pretrained, out_index=out_index)
         self.geom = GeometryTransformer(bev_h=bev_h, bev_w=bev_w, bev_bounds=bev_bounds, warp_impl='kornia')
-        self.fusion = ConcatFusion()
+        fusion_cfg = cfg['MODEL'].get('FUSION', {})
+        fusion_type = str(fusion_cfg.get('TYPE', 'concat')).lower()
+        if fusion_type == 'simple':
+            fusion_mode = fusion_cfg.get('MODE', 'sum')
+            self.fusion = SimpleFusion(mode=fusion_mode)
+        elif fusion_type == 'attention':
+            num_heads = int(fusion_cfg.get('NUM_HEADS', 4))
+            dropout = float(fusion_cfg.get('DROPOUT', 0.0))
+            self.fusion = AttentionFusion(channel_dim=feat_dim, num_heads=num_heads, dropout=dropout)
+        else:
+            self.fusion = ConcatFusion()
         # detector in_channels = V*C + 2 (pos enc)
         # Note: actual V known at runtime; we build head lazily on first forward
         self.detector = None

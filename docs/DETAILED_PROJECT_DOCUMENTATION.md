@@ -311,7 +311,12 @@ Wildtrack 数据集读取与标定解析。包含大量 XML 解析与几何投�
   - **`forward(self, bev_maps)`**：根据模式在视角维度做求和、平均或逐元素最大。
 
 - `class AttentionFusion(FusionModule)`
-  - 占位实现：首次调用打印警告并标记 `_warned=True`，随后退化为均值融合。
+  - 将每个 BEV 位置的多视角特征视作长度为 V 的序列，借助可学习的 query token 与 `nn.MultiheadAttention` 完成跨视角注意力池化。
+  - `__init__(channel_dim, num_heads=4, dropout=0.0)`：校验通道数与头数的整除关系，实例化多头注意力、LayerNorm 与 MLP，用以提炼聚合后的特征。
+  - `forward(self, bev_maps)`：
+    1. 把 `[B,V,C,H,W]` 排列为 `[V,B*H*W,C]`，使每个 BEV 栅格对应一个 attention batch。
+    2. 通过 query token 汇聚各视角特征，得到 `[B*H*W,C]` 的融合表示。
+    3. 使用 `LayerNorm + MLP` 做残差平滑，最后 reshape 回 `[B,C,H,W]`。
 
 - `class ConcatFusion(FusionModule)`
   - **`forward(self, bev_maps)`**：重新 reshape 为 `[B, V*C, H, W]`，即沿通道维拼接视角特征。`BEVNet` 默认使用该策略。
@@ -350,8 +355,8 @@ Wildtrack 数据集读取与标定解析。包含大量 XML 解析与几何投�
 - `class BEVNet(nn.Module)`
   - **`__init__(self, cfg)`**：
     - 解析模型相关配置：特征通道、BEV 尺寸/边界、骨干、预训练开关、特征层索引，以及推理/损失阈值。
-    - 初始化组件：`CNNEncoder`、`GeometryTransformer`（默认优先 `kornia`）、`ConcatFusion`。
-    - 检测头延迟构建，以便在第一次前向时确定输入通道数（`V*C + 2`，其中 2 来自位置编码）。
+    - 初始化组件：`CNNEncoder`、`GeometryTransformer`（默认优先 `kornia`），并依据 `MODEL.FUSION.TYPE` 选择 `ConcatFusion`、`SimpleFusion` 或 `AttentionFusion`。
+    - 检测头延迟构建，以便在第一次前向时确定输入通道数（Concat 产生 `V*C + 2` 通道，注意力/简单融合保持 `C + 2`）。
     - 通过 `register_buffer` 缓存 `pos_enc`（`_create_pos_enc` 生成）。
   - **`forward(self, batch)`**：
     1. 读取 `batch['images']`（`[B,V,3,H,W]`）。
