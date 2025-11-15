@@ -1,4 +1,3 @@
-import os
 import argparse
 import yaml
 import torch
@@ -6,6 +5,7 @@ from torch.utils.data import DataLoader
 
 from data.wildtrack_loader import WildtrackDataset, collate_fn
 from models.model_wrapper import BEVNet
+from plugins import build_plugins
 from utils.visualization import save_predictions_json
 
 
@@ -33,7 +33,10 @@ def main():
     model.eval()
 
     out_dir = cfg['RUNTIME']['OUTPUT_DIR']
-    frame_indices = []
+    run_context = {'output_dir': out_dir, 'device': device}
+    plugins = build_plugins(cfg, device=device, output_dir=out_dir)
+    for plugin in plugins:
+        plugin.on_start(run_context)
 
     with torch.no_grad():
         for batch in dl:
@@ -42,8 +45,15 @@ def main():
                 batch['calib']['intrinsic'][b] = [k.to(device) for k in batch['calib']['intrinsic'][b]]
                 batch['calib']['extrinsic'][b] = [e.to(device) for e in batch['calib']['extrinsic'][b]]
             preds = model(batch)
-            frame_indices = [m['frame_idx'] for m in batch['meta']]
+            frame_indices = [int(m['frame_idx']) for m in batch['meta']]
+
+            for plugin in plugins:
+                plugin.on_batch(preds, batch, run_context)
+
             save_predictions_json(preds['boxes'], preds['scores'], out_dir, frame_indices)
+
+    for plugin in plugins:
+        plugin.on_finish(run_context)
 
     print(f"Saved predictions JSON to {out_dir}")
 
