@@ -6,7 +6,7 @@ from typing import Dict, Any, Tuple, List
 
 from .encoders.cnn_encoder import CNNEncoder
 from .fusion.geometry import GeometryTransformer
-from .fusion.fusion import SimpleFusion, ConcatFusion
+from .fusion.fusion import AttentionFusion
 from .heads.detector import BEVDetector
 
 
@@ -40,7 +40,10 @@ class BEVNet(nn.Module):
         # modules
         self.encoder = CNNEncoder(out_channels=feat_dim, backbone=backbone, pretrained=use_pretrained, out_index=out_index)
         self.geom = GeometryTransformer(bev_h=bev_h, bev_w=bev_w, bev_bounds=bev_bounds, warp_impl='kornia')
-        self.fusion = ConcatFusion()
+
+        # Use AttentionFusion directly
+        self.fusion = AttentionFusion(in_channels=feat_dim)
+
         # detector in_channels = V*C + 2 (pos enc)
         # Note: actual V known at runtime; we build head lazily on first forward
         self.detector = None
@@ -306,38 +309,6 @@ class BEVNet(nn.Module):
         idx_exp = indices.unsqueeze(-1).expand(-1, -1, C)
         gathered = torch.gather(feat, 1, idx_exp)
         return gathered
-
-    def _geom_consistency_loss(self, targets: List[Dict], num_samples: int = 128) -> torch.Tensor:
-        # Sample points in BEV and enforce img->world->bev round-trip consistency
-        device = next(self.parameters()).device
-        x_min, x_max, y_min, y_max = self.bounds
-        xs = torch.linspace(x_min, x_max, self.bev_w, device=device)
-        ys = torch.linspace(y_min, y_max, self.bev_h, device=device)
-        yy, xx = torch.meshgrid(ys, xs, indexing='ij')
-        pts = torch.stack([xx.reshape(-1), yy.reshape(-1), torch.ones(self.bev_w * self.bev_h, device=device)], dim=1)  # [N,3]
-        idx = torch.randperm(pts.shape[0], device=device)[:num_samples]
-        pts = pts[idx]  # [K,3]
-        loss = torch.zeros((), device=device)
-        # use first sample's calib if available
-        if len(targets) == 0:
-            return loss
-        calib = targets[0].get('calib', None)
-        if calib is None:
-            return loss
-        K_list = calib.get('intrinsic', [])
-        Rt_list = calib.get('extrinsic', [])
-        for K, Rt in zip(K_list, Rt_list):
-            H_w2i = GeometryTransformer._compute_homography(K.to(device), Rt.to(device))
-            uvw = (H_w2i @ pts.T)  # [3,K]
-            w = uvw[2:3, :]
-            w_safe = torch.where(w.abs() < 1e-6, torch.ones_like(w), w)
-            u = uvw[0:1, :] / w_safe
-            v = uvw[1:2, :] / w_safe
-            H_i2w = GeometryTransformer._compute_img_to_world_homography(K.to(device), Rt.to(device))
-            back = H_i2w @ torch.stack([u.squeeze(0), v.squeeze(0), torch.ones_like(u.squeeze(0))], dim=0)
-            back_xy = back[:2, :].T  # [K,2]
-            loss = loss + F.l1_loss(back_xy, pts[:, :2])
-        return loss / max(1, len(K_list))
 
     @staticmethod
     def _create_pos_enc(H: int, W: int, bounds: Tuple[float, float, float, float]) -> torch.Tensor:
